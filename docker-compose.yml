@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  champion-bot:
+    build: .
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      - WAZZUP_API_KEY=${WAZZUP_API_KEY}
+      - ENVY_CRM_URL=https://champion.envycrm.com
+      - ENVY_API_KEY=8e9941a4ff86b27e9d3238c8c9732076c7bc74e5
+      - PORT=8080
+      # Опционально: WEBHOOK_SECRET=ваш_секрет
