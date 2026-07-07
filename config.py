@@ -24,7 +24,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 # Google Sheets (синхронизация базы знаний)
 # GOOGLE_CREDENTIALS_JSON — весь JSON сервисного аккаунта одной строкой (Railway env var)
-SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID", "1aN89a8YEqVbHsPW1hdKp1-Sgay7LhQD6")
+SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID", "13zyjRX1e_Z3x92PUWLKoMynGMFBWzvZS9oPNm7XRQ_Y")
 
 # Railway / PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL", "")

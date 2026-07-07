@@ -1,14 +1,22 @@
 version: "3.9"
 
 services:
-  champion-bot:
+  luna-bot:
     build: .
     restart: always
     ports:
       - "8080:8080"
     environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - WAZZUP_API_KEY=${WAZZUP_API_KEY}
-      - ENVY_CRM_URL=https://champion.envycrm.com
-      - ENVY_API_KEY=8e9941a4ff86b27e9d3238c8c9732076c7bc74e5
+      - ENVY_CRM_URL=https://shkolaobucheniya.envycrm.com
+      - ENVY_API_KEY=${ENVY_API_KEY}
+      - ENVY_OPERATOR_KEY=${ENVY_OPERATOR_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DATABASE_URL=${DATABASE_URL}
+      - GOOGLE_CREDENTIALS_JSON=${GOOGLE_CREDENTIALS_JSON}
+      - SHEETS_SPREADSHEET_ID=${SHEETS_SPREADSHEET_ID}
+      - BOT_PAUSED_INSTAGRAM=false
       - PORT=8080
-      # Опционально: WEBHOOK_SECRET=ваш_секрет
+      # Реальные значения ключей — только в .env файле или Railway Variables,
+      # никогда не хардкодить прямо здесь (см. security audit у Лолы).

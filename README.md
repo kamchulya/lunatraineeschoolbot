@@ -78,7 +78,7 @@ ENVY_OPERATOR_KEY=        # (опционально)
 OPENAI_API_KEY=           # Для транскрипции голосовых (Whisper)
 DATABASE_URL=             # Автоматически от Railway PostgreSQL
 GOOGLE_CREDENTIALS_JSON=  # JSON сервисного аккаунта одной строкой
-SHEETS_SPREADSHEET_ID=    # 1aN89a8YEqVbHsPW1hdKp1-Sgay7LhQD6
+SHEETS_SPREADSHEET_ID=    # 13zyjRX1e_Z3x92PUWLKoMynGMFBWzvZS9oPNm7XRQ_Y
 BOT_PAUSED_INSTAGRAM=     # false (поставить true чтобы заглушить бота)
 PORT=                     # Автоматически от Railway
 ```
@@ -87,7 +87,7 @@ PORT=                     # Автоматически от Railway
 
 ## Google Sheets
 
-Таблица с живыми данными: [champion_school_data](https://docs.google.com/spreadsheets/d/1aN89a8YEqVbHsPW1hdKp1-Sgay7LhQD6)
+Таблица с живыми данными: [champion_school_data](https://docs.google.com/spreadsheets/d/13zyjRX1e_Z3x92PUWLKoMynGMFBWzvZS9oPNm7XRQ_Y)
 
 Листы:
 - **Курсы и тарифы** — цены, даты стартов, места (редактирует клиент)

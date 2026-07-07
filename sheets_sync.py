@@ -1,7 +1,7 @@
 """
 Синхронизация базы знаний Луны с Google Sheets.
 
-Таблица: https://docs.google.com/spreadsheets/d/1aN89a8YEqVbHsPW1hdKp1-Sgay7LhQD6
+Таблица: https://docs.google.com/spreadsheets/d/13zyjRX1e_Z3x92PUWLKoMynGMFBWzvZS9oPNm7XRQ_Y
 Листы: "Курсы и тарифы", "Программа курсов", "Демо-доступ", "О школе и FAQ"
 
 Аутентификация — через сервисный аккаунт Google (GOOGLE_CREDENTIALS_JSON в env,
@@ -17,7 +17,7 @@ from googleapiclient.discovery import build
 
 log = logging.getLogger(__name__)
 
-SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID", "1aN89a8YEqVbHsPW1hdKp1-Sgay7LhQD6")
+SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID", "13zyjRX1e_Z3x92PUWLKoMynGMFBWzvZS9oPNm7XRQ_Y")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 SHEET_TARIFFS = "Курсы и тарифы"

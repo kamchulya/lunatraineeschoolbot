@@ -946,8 +946,13 @@ async def init_scheduler(app: web.Application) -> None:
     log.info(f"📊 Sheets sync при старте: {'✅' if ok else '⚠️ fallback на knowledge_base.py'}")
 
     # Каждые 30 минут
+    async def _sync_sheets_job() -> None:
+        loop = asyncio.get_running_loop()
+        ok = await loop.run_in_executor(None, sheets_sync.refresh_cache)
+        log.info(f"📊 Sheets sync (по расписанию): {'✅' if ok else '⚠️ fallback на knowledge_base.py'}")
+
     scheduler.add_job(
-        lambda: asyncio.get_event_loop().run_in_executor(None, sheets_sync.refresh_cache),
+        _sync_sheets_job,
         IntervalTrigger(minutes=30),
         id="sheets_sync",
         replace_existing=True,
