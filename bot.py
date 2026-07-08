@@ -175,10 +175,10 @@ async def set_state(
         await conn.execute(
             """
             INSERT INTO dialogs (chat_id, state, history, deal_id, updated_at)
-            VALUES ($1, $2, $3::jsonb, $4, NOW())
+            VALUES ($1, $2, COALESCE($3::jsonb, '[]'::jsonb), $4, NOW())
             ON CONFLICT (chat_id) DO UPDATE
                 SET state      = EXCLUDED.state,
-                    history    = COALESCE(EXCLUDED.history, dialogs.history),
+                    history    = COALESCE($3::jsonb, dialogs.history),
                     deal_id    = COALESCE(EXCLUDED.deal_id, dialogs.deal_id),
                     updated_at = NOW()
             """,
@@ -197,10 +197,10 @@ async def set_state_guarded(
         await conn.execute(
             """
             INSERT INTO dialogs (chat_id, state, history, deal_id, updated_at)
-            VALUES ($1, $2, $3::jsonb, $4, NOW())
+            VALUES ($1, $2, COALESCE($3::jsonb, '[]'::jsonb), $4, NOW())
             ON CONFLICT (chat_id) DO UPDATE
                 SET state      = EXCLUDED.state,
-                    history    = COALESCE(EXCLUDED.history, dialogs.history),
+                    history    = COALESCE($3::jsonb, dialogs.history),
                     deal_id    = COALESCE(EXCLUDED.deal_id, dialogs.deal_id),
                     updated_at = NOW()
                 WHERE dialogs.state NOT IN ('manager', 'done', 'refused', 'smm')
