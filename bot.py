@@ -73,10 +73,6 @@ INVOLVEMENT_TRIGGERS: dict[str, list[str]] = {
         "уже оплатил", "уже оплатила", "я оплатил курс",
         "я уже записан", "уже записана на курс",
     ],
-    "вопрос по сертификату/диплому": [
-        "получить сертификат", "где мой сертификат", "когда выдадут",
-        "пришлите сертификат", "не получил сертификат",
-    ],
     "жалоба на преподавателя": [
         "жалоба на", "недоволен преподавателем", "недовольна преподавателем",
         "претензия к", "плохой лектор", "преподаватель грубит",
@@ -1018,7 +1014,11 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
 
     if raw_text.strip() == "You mentioned in the story":
         return web.Response(text="ok")
-    if any(a.get("type") in ("story", "video") and not raw_text.strip() for a in attachments):
+    if any(a.get("type") in ("story", "video") for a in attachments):
+        # Реклама Reels/сторис в Instagram при "Написать" шлёт отдельным сообщением
+        # весь текст объявления (с эмодзи/видео) — это не то, что печатает клиент.
+        # Реальный вопрос клиента всегда приходит отдельным сообщением следом.
+        log.info(f"📹 Пропускаем автоцитату рекламы (video/story) от chat_id={chat_id}")
         return web.Response(text="ok")
 
     if any(a.get("type") in ("audio", "voice") and not raw_text.strip() for a in attachments):
