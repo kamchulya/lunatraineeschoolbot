@@ -57,8 +57,8 @@ STATE_SMM       = "smm"
 SILENT_STATES = {STATE_DONE, STATE_MANAGER, STATE_REFUSED, STATE_SMM}
 
 # ---------- Involvement / эскалация ----------
-# Заполнить после поиска stage_id через /deal/get в shkolaobucheniya.envycrm.com
-INVOLVEMENT_STAGE_ID: int | None = None  # TODO: найти stage_id через /deal/get
+# Раньше пытались двигать сделку в CRM по этой стадии, но stage_id так и не был найден.
+# Эскалация теперь идёт напрямую в WhatsApp Артёму (send_whatsapp_escalation) — CRM-стадия не нужна.
 
 INVOLVEMENT_TRIGGERS: dict[str, list[str]] = {
     "перенос даты обучения": [
@@ -143,6 +143,7 @@ log = logging.getLogger(__name__)
 
 db_pool: asyncpg.Pool | None = None
 scheduler: AsyncIOScheduler | None = None
+http_session: aiohttp.ClientSession | None = None
 processed_message_ids: deque = deque(maxlen=1000)
 sent_texts: dict[str, dict[str, datetime]] = {}
 dialog_locks: OrderedDict = OrderedDict()
@@ -292,18 +293,17 @@ async def send_wazzup(chat_id: str, text: str) -> None:
         if delay:
             await asyncio.sleep(delay)
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=body, headers=headers) as resp:
-                    result = await resp.text()
-                    log.info(f"📤 Wazzup → {chat_id} attempt={attempt+1} [{resp.status}]: {result[:200]}")
-                    if resp.status < 500:
-                        now = datetime.now(timezone.utc)
-                        bucket = sent_texts.setdefault(chat_id, {})
-                        expired = [t for t, ts in bucket.items() if (now - ts).total_seconds() > 3600]
-                        for t in expired:
-                            del bucket[t]
-                        bucket[text] = now
-                        return
+            async with http_session.post(url, json=body, headers=headers) as resp:
+                result = await resp.text()
+                log.info(f"📤 Wazzup → {chat_id} attempt={attempt+1} [{resp.status}]: {result[:200]}")
+                if resp.status < 500:
+                    now = datetime.now(timezone.utc)
+                    bucket = sent_texts.setdefault(chat_id, {})
+                    expired = [t for t, ts in bucket.items() if (now - ts).total_seconds() > 3600]
+                    for t in expired:
+                        del bucket[t]
+                    bucket[text] = now
+                    return
         except Exception as e:
             log.warning(f"⚠️ Wazzup attempt {attempt+1} error: {e}")
     log.error(f"❌ Wazzup: все 3 попытки провалились для {chat_id}")
@@ -364,17 +364,16 @@ async def find_lead(username: str, phone: str | None = None, retries: int = 3, d
     body = {"limit": 1, "inputs": {"phone": phone}} if phone else {"limit": 1, "keyword": username}
     for attempt in range(retries):
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=body, headers=headers) as resp:
-                    raw = await resp.text()
-                    data = json.loads(raw) if raw else {}
-                    leads_data = data.get("leads") or {}
-                    result = leads_data.get("result") or []
-                    if result:
-                        return result[0]["id"]
-                    all_ids = leads_data.get("all_ids") or []
-                    if all_ids and attempt == retries - 1:
-                        return all_ids[0]
+            async with http_session.post(url, json=body, headers=headers) as resp:
+                raw = await resp.text()
+                data = json.loads(raw) if raw else {}
+                leads_data = data.get("leads") or {}
+                result = leads_data.get("result") or []
+                if result:
+                    return result[0]["id"]
+                all_ids = leads_data.get("all_ids") or []
+                if all_ids and attempt == retries - 1:
+                    return all_ids[0]
         except Exception as e:
             log.error(f"❌ find_lead error attempt={attempt+1}: {e}")
         if attempt < retries - 1:
@@ -387,9 +386,8 @@ async def create_lead_log(lead_id: int, comment: str) -> None:
         url = f"{ENVY_CRM_URL}/openapi/v1/lead/log/create?api_key={ENVY_API_KEY}"
         headers = {"Content-Type": "application/json"}
         body = {"lead_id": lead_id, "type_id": 10, "data": {"comment": comment}}
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=body, headers=headers) as resp:
-                log.info(f"📝 create_lead_log lead_id={lead_id} [{resp.status}]")
+        async with http_session.post(url, json=body, headers=headers) as resp:
+            log.info(f"📝 create_lead_log lead_id={lead_id} [{resp.status}]")
     except Exception as e:
         log.error(f"❌ create_lead_log error: {e}")
 
@@ -401,94 +399,34 @@ async def lead_to_inbox(lead_id: int, chat_id: str, known_deal_id: int | None = 
 
         if not deal_id:
             url1 = f"{ENVY_CRM_URL}/openapi/v1/lead/get?api_key={ENVY_API_KEY}"
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url1, json={"lead_id": lead_id}, headers=headers) as resp:
-                    data = await resp.json()
-                    deals = data.get("result", {}).get("deals") or []
-                    if deals:
-                        deal_id = deals[0]
-                        await save_deal_id(chat_id, deal_id)
+            async with http_session.post(url1, json={"lead_id": lead_id}, headers=headers) as resp:
+                data = await resp.json()
+                deals = data.get("result", {}).get("deals") or []
+                if deals:
+                    deal_id = deals[0]
+                    await save_deal_id(chat_id, deal_id)
 
         if not deal_id and REAL_MANAGERS:
             random_employee_id = random.choice(REAL_MANAGERS)
             url_start = f"{ENVY_CRM_URL}/openapi/v1/lead/start?api_key={ENVY_API_KEY}"
             body_start = {"lead_id": lead_id, "employee_id": random_employee_id}
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url_start, json=body_start, headers=headers) as resp:
-                    data = await resp.json()
-                    new_deal_id = (data.get("result") or {}).get("deal_id")
-                    if new_deal_id:
-                        deal_id = new_deal_id
-                        await save_deal_id(chat_id, deal_id)
+            async with http_session.post(url_start, json=body_start, headers=headers) as resp:
+                data = await resp.json()
+                new_deal_id = (data.get("result") or {}).get("deal_id")
+                if new_deal_id:
+                    deal_id = new_deal_id
+                    await save_deal_id(chat_id, deal_id)
 
         if not deal_id:
             log.warning(f"⚠️ lead_to_inbox: нет deal_id для lead_id={lead_id}")
             return
 
         url2 = f"{ENVY_CRM_URL}/openapi/v1/deal/toInbox?api_key={ENVY_API_KEY}"
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url2, json={"deal_id": deal_id}, headers=headers) as resp:
-                log.info(f"📥 deal/toInbox deal_id={deal_id} [{resp.status}]")
+        async with http_session.post(url2, json={"deal_id": deal_id}, headers=headers) as resp:
+            log.info(f"📥 deal/toInbox deal_id={deal_id} [{resp.status}]")
     except Exception as e:
         log.error(f"❌ lead_to_inbox error: {e}")
 
-
-async def update_deal_stage(deal_id: int, stage_id: int) -> bool:
-    try:
-        url = f"{ENVY_CRM_URL}/openapi/v1/deal/updateDealStage?api_key={ENVY_API_KEY}"
-        body = {"deal_id": deal_id, "stage_id": stage_id}
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=body, headers={"Content-Type": "application/json"}) as resp:
-                log.info(f"🙋 deal/updateDealStage deal_id={deal_id} stage_id={stage_id} [{resp.status}]")
-                return resp.status == 200
-    except Exception as e:
-        log.error(f"❌ update_deal_stage error: {e}")
-        return False
-
-
-async def escalate_to_involvement(
-    chat_id: str, username: str, client_text: str, category: str, known_deal_id: int | None = None
-) -> None:
-    if INVOLVEMENT_STAGE_ID is None:
-        log.warning("⚠️ escalate_to_involvement: INVOLVEMENT_STAGE_ID не задан")
-        return
-    try:
-        lead_id = await find_lead(username)
-        if lead_id is None:
-            log.warning(f"⚠️ escalate_to_involvement: лид не найден username={username}")
-            return
-        await create_lead_log(lead_id, f"🙋 Луна: требует вовлечения ({category}) — «{client_text[:200]}»")
-        headers = {"Content-Type": "application/json"}
-        deal_id = known_deal_id
-
-        if not deal_id:
-            url1 = f"{ENVY_CRM_URL}/openapi/v1/lead/get?api_key={ENVY_API_KEY}"
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url1, json={"lead_id": lead_id}, headers=headers) as resp:
-                    data = await resp.json()
-                    deals = data.get("result", {}).get("deals") or []
-                    if deals:
-                        deal_id = deals[0]
-                        await save_deal_id(chat_id, deal_id)
-
-        if not deal_id and REAL_MANAGERS:
-            random_employee_id = random.choice(REAL_MANAGERS)
-            url_start = f"{ENVY_CRM_URL}/openapi/v1/lead/start?api_key={ENVY_API_KEY}"
-            body_start = {"lead_id": lead_id, "employee_id": random_employee_id}
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url_start, json=body_start, headers=headers) as resp:
-                    data = await resp.json()
-                    new_deal_id = (data.get("result") or {}).get("deal_id")
-                    if new_deal_id:
-                        deal_id = new_deal_id
-                        await save_deal_id(chat_id, deal_id)
-
-        if deal_id:
-            await update_deal_stage(deal_id, INVOLVEMENT_STAGE_ID)
-        else:
-            log.warning(f"⚠️ escalate_to_involvement: нет deal_id для lead_id={lead_id}")
-    except Exception as e:
-        log.error(f"❌ escalate_to_involvement error: {e}")
 
 
 # ---------- Wazzup: WhatsApp-уведомления Артёму ----------
@@ -509,15 +447,69 @@ async def send_whatsapp_to_manager(text: str) -> None:
         if delay:
             await asyncio.sleep(delay)
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=body, headers=headers) as resp:
-                    result = await resp.text()
-                    log.info(f"📲 WhatsApp → Артём attempt={attempt+1} [{resp.status}]: {result[:200]}")
-                    if resp.status < 500:
-                        return
+            async with http_session.post(url, json=body, headers=headers) as resp:
+                result = await resp.text()
+                log.info(f"📲 WhatsApp → Артём attempt={attempt+1} [{resp.status}]: {result[:200]}")
+                if resp.status < 500:
+                    return
         except Exception as e:
             log.warning(f"⚠️ WhatsApp → Артём attempt {attempt+1} error: {e}")
     log.error("❌ WhatsApp → Артём: все 3 попытки провалились")
+
+
+UNKNOWN_ANSWER_MARKER = "передала ваш вопрос менеджеру"
+
+
+def detect_unknown_answer(reply: str) -> bool:
+    return UNKNOWN_ANSWER_MARKER in (reply or "").lower()
+
+
+async def extract_client_info(history: list) -> tuple[str | None, str | None]:
+    """Пытается вытащить имя и телефон клиента из истории диалога через Claude
+    (дёшево — Haiku, вызывается только когда реально нужно для уведомления)."""
+    if not history:
+        return None, None
+    transcript = "\n".join(
+        f"{'Клиент' if m.get('role') == 'user' else 'Луна'}: {m.get('content', '')}"
+        for m in history[-20:]
+    )
+    try:
+        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        msg = await client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=100,
+            temperature=0,
+            system=(
+                "Извлеки из диалога имя клиента и номер телефона, если они там названы. "
+                'Ответь СТРОГО в формате JSON: {"name": "...", "phone": "..."} '
+                'Если чего-то нет — null вместо значения. Больше ничего не пиши.'
+            ),
+            messages=[{"role": "user", "content": transcript}],
+        )
+        raw = msg.content[0].text.strip()
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+        data = json.loads(raw)
+        return data.get("name"), data.get("phone")
+    except Exception as e:
+        log.error(f"❌ extract_client_info error: {e}")
+        return None, None
+
+
+async def send_unknown_question_notification(chat_id: str, client_text: str, history: list) -> None:
+    """Луна не знает ответа и пообещала клиенту связь с менеджером — уведомляем Артёма."""
+    name, phone = await extract_client_info(history)
+    ig_link = f"https://instagram.com/{chat_id}"
+    lines = [
+        "❓ Луна не смогла ответить — обещала связь с менеджером",
+        "",
+        f"Instagram: @{chat_id} ({ig_link})",
+    ]
+    if name:
+        lines.append(f"Имя: {name}")
+    if phone:
+        lines.append(f"Телефон: {phone}")
+    lines.append(f"Вопрос клиента: «{client_text[:300]}»")
+    await send_whatsapp_to_manager("\n".join(lines))
 
 
 whatsapp_escalated: set[str] = set()  # чтобы не слать уведомление повторно по одной и той же теме в диалоге
@@ -664,11 +656,10 @@ async def claude_reply(messages: list[dict], system_prompt: str | None = None, k
 
 async def transcribe_audio(url: str) -> str | None:
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    return None
-                audio_bytes = await resp.read()
+        async with http_session.get(url) as resp:
+            if resp.status != 200:
+                return None
+            audio_bytes = await resp.read()
         buf = io.BytesIO(audio_bytes)
         buf.name = "audio.ogg"
         client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -756,6 +747,10 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
         log.info(f"💬 Ответ Луны → {chat_id}: {reply[:300]}")
         await send_wazzup(chat_id, reply)
         asyncio.create_task(log_message(chat_id, "assistant", reply))
+        if detect_unknown_answer(reply):
+            asyncio.create_task(
+                send_unknown_question_notification(chat_id, text or "(первое сообщение)", history)
+            )
         if len(last_bot_reply) >= 10000:
             del last_bot_reply[next(iter(last_bot_reply))]
         last_bot_reply[chat_id] = reply
@@ -778,9 +773,6 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
                 asyncio.create_task(notify_manager(chat_id, chat_id, phone, known_deal_id=deal_id))
             involvement_category = detect_involvement_category(text)
             if involvement_category:
-                asyncio.create_task(
-                    escalate_to_involvement(chat_id, chat_id, text, involvement_category, known_deal_id=deal_id)
-                )
                 asyncio.create_task(send_whatsapp_escalation(chat_id, involvement_category, text))
                 log.info(f"🙋 {chat_id} требует вовлечения ({involvement_category}) — первым сообщением")
             if detect_payment_claim(text):
@@ -801,9 +793,6 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
     # Lesson 9.5: эскалация для всех состояний
     involvement_category = detect_involvement_category(text)
     if involvement_category:
-        asyncio.create_task(
-            escalate_to_involvement(chat_id, chat_id, text, involvement_category, known_deal_id=deal_id)
-        )
         asyncio.create_task(send_whatsapp_escalation(chat_id, involvement_category, text))
         log.info(f"🙋 {chat_id} требует вовлечения ({involvement_category})")
 
@@ -845,6 +834,8 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
     log.info(f"💬 Ответ Луны → {chat_id}: {reply[:300]}")
     await send_wazzup(chat_id, reply)
     asyncio.create_task(log_message(chat_id, "assistant", reply))
+    if detect_unknown_answer(reply):
+        asyncio.create_task(send_unknown_question_notification(chat_id, text, history))
     if len(last_bot_reply) >= 10000:
         del last_bot_reply[next(iter(last_bot_reply))]
     last_bot_reply[chat_id] = reply
@@ -891,6 +882,8 @@ async def _answer_pending(chat_id: str) -> None:
     log.info(f"💬 Отложенный ответ Луны (менеджер не подключился за 30 мин) → {chat_id}: {reply[:300]}")
     await send_wazzup(chat_id, reply)
     asyncio.create_task(log_message(chat_id, "assistant", reply))
+    if detect_unknown_answer(reply):
+        asyncio.create_task(send_unknown_question_notification(chat_id, text, history))
     if len(last_bot_reply) >= 10000:
         del last_bot_reply[next(iter(last_bot_reply))]
     last_bot_reply[chat_id] = reply
@@ -1110,6 +1103,18 @@ async def close_db(app: web.Application) -> None:
         await db_pool.close()
 
 
+# ---------- HTTP-сессия (одна на всё приложение вместо новой на каждый запрос) ----------
+async def init_http_session(app: web.Application) -> None:
+    global http_session
+    http_session = aiohttp.ClientSession()
+    log.info("✅ HTTP-сессия инициализирована")
+
+
+async def close_http_session(app: web.Application) -> None:
+    if http_session:
+        await http_session.close()
+
+
 # ---------- Ежедневный отчёт Артёму ----------
 async def summarize_top_questions(texts: list[str]) -> str:
     if not texts:
@@ -1215,11 +1220,13 @@ def create_app() -> web.Application:
     app.router.add_post("/envy_hook", envy_hook_handler)
     app.router.add_post("/wazzup",    lambda r: web.Response(text="ok"))
     app.router.add_get("/health",     health_handler)
+    app.on_startup.append(init_http_session)
     app.on_startup.append(init_db)
     app.on_startup.append(init_scheduler)
     app.on_startup.append(start_background_tasks)
     app.on_cleanup.append(close_db)
     app.on_cleanup.append(close_scheduler)
+    app.on_cleanup.append(close_http_session)
     return app
 
 
