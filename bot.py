@@ -16,6 +16,7 @@ import openai
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 
 from config import (
     ANTHROPIC_API_KEY,
@@ -28,6 +29,8 @@ from config import (
     DATABASE_URL,
     PORT,
     BOT_PAUSED_INSTAGRAM,
+    ARTYOM_WHATSAPP_PERSONAL,
+    WAZZUP_WHATSAPP_CHANNEL_ID,
 )
 from prompt import SYSTEM_PROMPT
 import sheets_sync
@@ -78,7 +81,24 @@ INVOLVEMENT_TRIGGERS: dict[str, list[str]] = {
         "жалоба на", "недоволен преподавателем", "недовольна преподавателем",
         "претензия к", "плохой лектор", "преподаватель грубит",
     ],
+    "не одобрили рассрочку": [
+        "не одобрили", "не одобрил", "отказали в рассрочке",
+        "не дали рассрочку", "рассрочку не дали", "каспи отказал",
+    ],
 }
+
+# Отдельно от вовлечения — клиент утверждает, что оплатил (нужна ручная проверка Kaspi/CRM)
+PAYMENT_CLAIM_KEYWORDS = [
+    "оплатил", "оплатила", "оплатили", "оплата прошла",
+    "перевела деньги", "перевёл деньги", "закинула деньги", "закинул деньги",
+    "скинула деньги", "скинул деньги", "отправил чек", "отправила чек",
+    "вот чек", "деньги отправила", "деньги отправил",
+]
+
+
+def detect_payment_claim(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in PAYMENT_CLAIM_KEYWORDS)
 
 # ---------- Напоминания после демо ----------
 REMINDER_DELAYS = [
@@ -129,6 +149,12 @@ dialog_locks: OrderedDict = OrderedDict()
 last_notify: dict[str, datetime] = {}
 last_bot_reply: dict[str, str] = {}
 
+# Дедап пачки сообщений, пришедших почти одновременно от одного контакта
+# (например Instagram шлёт текст + вложение + повтор отдельными вебхуками)
+DEBOUNCE_SECONDS = 4.0
+pending_buffer: dict[str, list[str]] = {}
+pending_tasks: dict[str, asyncio.Task] = {}
+
 MAX_HISTORY = 20
 
 
@@ -153,6 +179,19 @@ def get_lock(chat_id: str) -> asyncio.Lock:
 
 
 # ---------- DB ----------
+async def log_message(chat_id: str, role: str, text: str | None) -> None:
+    if not text:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO message_log (chat_id, role, text) VALUES ($1, $2, $3)",
+                chat_id, role, text,
+            )
+    except Exception as e:
+        log.error(f"❌ log_message error {chat_id}: {e}")
+
+
 async def get_state(chat_id: str) -> tuple[str | None, list, datetime | None, int | None]:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -452,6 +491,78 @@ async def escalate_to_involvement(
         log.error(f"❌ escalate_to_involvement error: {e}")
 
 
+# ---------- Wazzup: WhatsApp-уведомления Артёму ----------
+async def send_whatsapp_to_manager(text: str) -> None:
+    url = "https://api.wazzup24.com/v3/message"
+    headers = {
+        "Authorization": f"Bearer {WAZZUP_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "channelId": WAZZUP_WHATSAPP_CHANNEL_ID,
+        "chatId": ARTYOM_WHATSAPP_PERSONAL.lstrip("+"),
+        "chatType": "whatsapp",
+        "text": text,
+    }
+    delays = [0, 2, 4]
+    for attempt, delay in enumerate(delays):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=body, headers=headers) as resp:
+                    result = await resp.text()
+                    log.info(f"📲 WhatsApp → Артём attempt={attempt+1} [{resp.status}]: {result[:200]}")
+                    if resp.status < 500:
+                        return
+        except Exception as e:
+            log.warning(f"⚠️ WhatsApp → Артём attempt {attempt+1} error: {e}")
+    log.error("❌ WhatsApp → Артём: все 3 попытки провалились")
+
+
+whatsapp_escalated: set[str] = set()  # чтобы не слать уведомление повторно по одной и той же теме в диалоге
+
+
+async def send_whatsapp_escalation(chat_id: str, category: str, client_text: str) -> None:
+    """Гарантированно (не полагаясь на LLM) уведомляет Артёма в WhatsApp
+    при триггерной теме — перенос/возврат/оплата/сертификат."""
+    dedup_key = f"{chat_id}:{category}"
+    if dedup_key in whatsapp_escalated:
+        return
+    whatsapp_escalated.add(dedup_key)
+    if len(whatsapp_escalated) > 10000:
+        whatsapp_escalated.clear()
+
+    ig_link = f"https://instagram.com/{chat_id}"
+    text = (
+        f"🙋 Луна: клиент требует вовлечения ({category})\n\n"
+        f"Instagram: @{chat_id} ({ig_link})\n"
+        f"Сообщение клиента: «{client_text[:300]}»"
+    )
+    await send_whatsapp_to_manager(text)
+
+
+payment_notified: set[str] = set()  # чтобы не слать повторно про оплату в одном диалоге
+
+
+async def send_payment_notification(chat_id: str, client_text: str) -> None:
+    """Клиент написал, что оплатил — уведомляем Артёма для ручной проверки в Kaspi/CRM."""
+    if chat_id in payment_notified:
+        return
+    payment_notified.add(chat_id)
+    if len(payment_notified) > 10000:
+        payment_notified.clear()
+
+    ig_link = f"https://instagram.com/{chat_id}"
+    text = (
+        f"💰 Луна: клиент утверждает, что оплатил(а) — нужна проверка!\n\n"
+        f"Instagram: @{chat_id} ({ig_link})\n"
+        f"Сообщение клиента: «{client_text[:300]}»\n\n"
+        f"Проверьте поступление в Kaspi/CRM и подтвердите клиенту."
+    )
+    await send_whatsapp_to_manager(text)
+
+
 def detect_involvement_category(text: str) -> str | None:
     t = text.lower()
     for category, phrases in INVOLVEMENT_TRIGGERS.items():
@@ -614,6 +725,9 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
     if state == STATE_DEMO_SENT and text:
         cancel_reminders(chat_id)
 
+    if text:
+        asyncio.create_task(log_message(chat_id, "user", text))
+
     # Новый диалог
     if state is None:
         if history is None:
@@ -641,6 +755,7 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
 
         log.info(f"💬 Ответ Луны → {chat_id}: {reply[:300]}")
         await send_wazzup(chat_id, reply)
+        asyncio.create_task(log_message(chat_id, "assistant", reply))
         if len(last_bot_reply) >= 10000:
             del last_bot_reply[next(iter(last_bot_reply))]
         last_bot_reply[chat_id] = reply
@@ -666,7 +781,11 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
                 asyncio.create_task(
                     escalate_to_involvement(chat_id, chat_id, text, involvement_category, known_deal_id=deal_id)
                 )
+                asyncio.create_task(send_whatsapp_escalation(chat_id, involvement_category, text))
                 log.info(f"🙋 {chat_id} требует вовлечения ({involvement_category}) — первым сообщением")
+            if detect_payment_claim(text):
+                asyncio.create_task(send_payment_notification(chat_id, text))
+                log.info(f"💰 {chat_id} утверждает, что оплатил — первым сообщением")
 
         log.info(f"👋 {'Новый' if is_truly_new else 'Возобновлённый'} диалог {chat_id} → {new_state}")
         return
@@ -685,7 +804,12 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
         asyncio.create_task(
             escalate_to_involvement(chat_id, chat_id, text, involvement_category, known_deal_id=deal_id)
         )
+        asyncio.create_task(send_whatsapp_escalation(chat_id, involvement_category, text))
         log.info(f"🙋 {chat_id} требует вовлечения ({involvement_category})")
+
+    if detect_payment_claim(text):
+        asyncio.create_task(send_payment_notification(chat_id, text))
+        log.info(f"💰 {chat_id} утверждает, что оплатил")
 
     if is_refusal(text):
         lang = detect_lang(text)
@@ -693,6 +817,7 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
         history.append({"role": "user", "content": text})
         history.append({"role": "assistant", "content": farewell})
         await send_wazzup(chat_id, farewell)
+        asyncio.create_task(log_message(chat_id, "assistant", farewell))
         await set_state(chat_id, STATE_REFUSED, history=history)
         cancel_reminders(chat_id)
         return
@@ -719,6 +844,7 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
 
     log.info(f"💬 Ответ Луны → {chat_id}: {reply[:300]}")
     await send_wazzup(chat_id, reply)
+    asyncio.create_task(log_message(chat_id, "assistant", reply))
     if len(last_bot_reply) >= 10000:
         del last_bot_reply[next(iter(last_bot_reply))]
     last_bot_reply[chat_id] = reply
@@ -764,6 +890,7 @@ async def _answer_pending(chat_id: str) -> None:
 
     log.info(f"💬 Отложенный ответ Луны (менеджер не подключился за 30 мин) → {chat_id}: {reply[:300]}")
     await send_wazzup(chat_id, reply)
+    asyncio.create_task(log_message(chat_id, "assistant", reply))
     if len(last_bot_reply) >= 10000:
         del last_bot_reply[next(iter(last_bot_reply))]
     last_bot_reply[chat_id] = reply
@@ -791,6 +918,29 @@ async def resume_unanswered_manager_chats() -> None:
 
 
 # ---------- Эндпоинты ----------
+async def _debounced_handle_incoming(chat_id: str) -> None:
+    """Ждёт DEBOUNCE_SECONDS без новых сообщений от chat_id, затем склеивает
+    всё что накопилось в один текст и обрабатывает разом (одним ответом)."""
+    try:
+        await asyncio.sleep(DEBOUNCE_SECONDS)
+    except asyncio.CancelledError:
+        return  # пришло новое сообщение — таймер перезапущен снаружи
+
+    texts = pending_buffer.pop(chat_id, [])
+    pending_tasks.pop(chat_id, None)
+    if not texts:
+        return
+
+    combined = "\n".join(t for t in texts if t).strip() or None
+    if len(texts) > 1:
+        log.info(f"🧩 Склеено {len(texts)} сообщений от {chat_id} в одно")
+
+    try:
+        await handle_incoming(chat_id, combined)
+    except Exception as e:
+        log.error(f"❌ handle_incoming error {chat_id}: {e}", exc_info=True)
+
+
 async def envy_hook_handler(request: web.Request) -> web.Response:
     if BOT_PAUSED_INSTAGRAM:
         return web.Response(text="ok")
@@ -887,6 +1037,18 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
     elif any(a.get("type") in ("image", "file") and not raw_text.strip() for a in attachments):
         # Lesson 10: клиент прислал фото/файл без подписи (например, чек) — не молчим
         text = "[клиент отправил вложение]"
+        # Луна не читает содержимое файлов (PDF/фото) — подстраховываемся и всегда
+        # шлём Артёму на проверку, вдруг это чек об оплате
+        attach_link = next(
+            (a.get("link") or a.get("url") for a in attachments if a.get("type") in ("image", "file")),
+            None,
+        )
+        asyncio.create_task(
+            send_payment_notification(
+                chat_id,
+                f"[файл без подписи, возможно чек]" + (f"\nСсылка: {attach_link}" if attach_link else ""),
+            )
+        )
     else:
         text = raw_text.strip() if raw_text else None
 
@@ -895,9 +1057,13 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
     try:
-        await handle_incoming(chat_id, text)
+        pending_buffer.setdefault(chat_id, []).append(text or "")
+        old_task = pending_tasks.get(chat_id)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        pending_tasks[chat_id] = asyncio.create_task(_debounced_handle_incoming(chat_id))
     except Exception as e:
-        log.error(f"❌ handle_incoming error {chat_id}: {e}", exc_info=True)
+        log.error(f"❌ debounce schedule error {chat_id}: {e}", exc_info=True)
 
     return web.Response(text="ok")
 
@@ -925,12 +1091,77 @@ async def init_db(app: web.Application) -> None:
         await conn.execute("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS history JSONB NOT NULL DEFAULT '[]'")
         await conn.execute("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS deal_id BIGINT")
         await conn.execute("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS awaiting_reply BOOLEAN NOT NULL DEFAULT FALSE")
+        # Лог сообщений клиентов — для ежедневного отчёта Артёму (кол-во клиентов, топ-темы)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS message_log (
+                id         BIGSERIAL PRIMARY KEY,
+                chat_id    TEXT NOT NULL,
+                role       TEXT NOT NULL,
+                text       TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_message_log_created_at ON message_log (created_at)")
     log.info("✅ DB готова")
 
 
 async def close_db(app: web.Application) -> None:
     if db_pool:
         await db_pool.close()
+
+
+# ---------- Ежедневный отчёт Артёму ----------
+async def summarize_top_questions(texts: list[str]) -> str:
+    if not texts:
+        return "— нет данных —"
+    joined = "\n".join(f"- {t}" for t in texts)
+    try:
+        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        msg = await client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=400,
+            temperature=0.2,
+            system=(
+                "Ты анализируешь сообщения клиентов фитнес-школы за сутки. "
+                "Выдели 5 самых частых тем/вопросов коротким списком на русском, "
+                "без вступлений и заключений. Каждая тема с новой строки, начинай с «•»."
+            ),
+            messages=[{"role": "user", "content": joined[:20000]}],
+        )
+        return msg.content[0].text.strip()
+    except Exception as e:
+        log.error(f"❌ summarize_top_questions error: {e}")
+        return "— не удалось проанализировать —"
+
+
+async def build_and_send_daily_report() -> None:
+    try:
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT chat_id, text FROM message_log WHERE role='user' AND created_at >= $1",
+                since,
+            )
+        today = datetime.now(timezone.utc).strftime("%d.%m.%Y")
+        if not rows:
+            await send_whatsapp_to_manager(f"📊 Отчёт Луны за сутки ({today}): новых обращений не было.")
+            return
+
+        unique_clients = len({r["chat_id"] for r in rows})
+        total_messages = len(rows)
+        sample_texts = [r["text"] for r in rows if r["text"]][:200]
+        topics_summary = await summarize_top_questions(sample_texts)
+
+        report = (
+            f"📊 Отчёт Луны за сутки ({today})\n\n"
+            f"👥 Уникальных клиентов: {unique_clients}\n"
+            f"💬 Сообщений от клиентов: {total_messages}\n\n"
+            f"🔝 Частые темы:\n{topics_summary}"
+        )
+        await send_whatsapp_to_manager(report)
+        log.info("📊 Ежедневный отчёт отправлен Артёму")
+    except Exception as e:
+        log.error(f"❌ build_and_send_daily_report error: {e}")
 
 
 # ---------- Scheduler init ----------
@@ -955,6 +1186,14 @@ async def init_scheduler(app: web.Application) -> None:
         _sync_sheets_job,
         IntervalTrigger(minutes=30),
         id="sheets_sync",
+        replace_existing=True,
+    )
+
+    # Ежедневный отчёт Артёму — 20:00 по Астане (UTC+5) = 15:00 UTC
+    scheduler.add_job(
+        build_and_send_daily_report,
+        CronTrigger(hour=15, minute=0),
+        id="daily_report",
         replace_existing=True,
     )
 
