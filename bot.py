@@ -15,7 +15,6 @@ from knowledge_base import KNOWLEDGE_BASE
 import openai
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 
 from config import (
@@ -1181,7 +1180,7 @@ async def init_scheduler(app: web.Application) -> None:
     ok = await loop.run_in_executor(None, sheets_sync.refresh_cache)
     log.info(f"📊 Sheets sync при старте: {'✅' if ok else '⚠️ fallback на knowledge_base.py'}")
 
-    # Каждые 30 минут
+    # 2 раза в день — 09:00 и 21:00 по Астане (UTC+5) = 04:00 и 16:00 UTC
     async def _sync_sheets_job() -> None:
         loop = asyncio.get_running_loop()
         ok = await loop.run_in_executor(None, sheets_sync.refresh_cache)
@@ -1189,7 +1188,7 @@ async def init_scheduler(app: web.Application) -> None:
 
     scheduler.add_job(
         _sync_sheets_job,
-        IntervalTrigger(minutes=30),
+        CronTrigger(hour="4,16", minute=0),
         id="sheets_sync",
         replace_existing=True,
     )
