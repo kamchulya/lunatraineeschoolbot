@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import json
 import os
 import re
@@ -7,23 +6,20 @@ import logging
 import random
 from collections import deque, OrderedDict
 from datetime import datetime, timezone, timedelta
-
 import io
 
 import aiohttp
 import asyncpg
 import anthropic
-import httpx
-from knowledge_base import get_knowledge_base
-import sheets_sync
-from rag import init_rag, get_context
+from knowledge_base import KNOWLEDGE_BASE
 import openai
 from aiohttp import web
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 from config import (
     ANTHROPIC_API_KEY,
     WAZZUP_API_KEY,
-    WAZZUP_WHATSAPP_CHANNEL_ID,
     WAZZUP_INSTAGRAM_CHANNEL_ID,
     OPENAI_API_KEY,
     ENVY_OPERATOR_KEY,
@@ -31,44 +27,90 @@ from config import (
     ENVY_CRM_URL,
     DATABASE_URL,
     PORT,
-    BOT_PAUSED_WHATSAPP,
     BOT_PAUSED_INSTAGRAM,
-    SIPUNI_USER,
-    SIPUNI_SECRET,
-    SIPUNI_CALLS_ENABLED,
-    SIPUNI_EMPLOYEE_SIPNUMBERS,
+    ARTYOM_WHATSAPP_PERSONAL,
+    WAZZUP_WHATSAPP_CHANNEL_ID,
 )
-from prompt import SYSTEM_PROMPT, WHATSAPP_PROMPT
+from prompt import SYSTEM_PROMPT
+import sheets_sync
 
-REAL_MANAGERS = [
-    1165916,  # Расул Ильясов
-    1166309,  # Тамирлан Бауржанов
-    1109958,  # Джони
-    1158023,  # Кайратулы Нурзат
-    1164185,  # Жайсангалиева Диляра
-    1163510,  # Каирлымова Дамира
-    1088614,  # Сейфуллина Алуа
+# ---------- Менеджеры EnvyCRM (shkolaobucheniya.envycrm.com) ----------
+REAL_MANAGERS: list[int] = [
+    1046932,  # Дмитрий
+    1101942,  # Артём ШЕФ
+    1127631,  # Диана
+    1139532,  # Димаш
+    1151420,  # Алдияр
+    1112091,  # Луна (живой менеджер, теперь тоже получает лиды наравне со всеми)
 ]
 
 # ---------- States ----------
-STATE_NEW     = "new"
-STATE_ACTIVE  = "active"
-STATE_DONE    = "done"
-STATE_MANAGER = "manager"
-STATE_REFUSED = "refused"
-STATE_SMM     = "smm"
+STATE_NEW       = "new"
+STATE_ACTIVE    = "active"
+STATE_DEMO_SENT = "demo_sent"
+STATE_DONE      = "done"
+STATE_MANAGER   = "manager"
+STATE_REFUSED   = "refused"
+STATE_SMM       = "smm"
 
 SILENT_STATES = {STATE_DONE, STATE_MANAGER, STATE_REFUSED, STATE_SMM}
 
+# ---------- Involvement / эскалация ----------
+# Раньше пытались двигать сделку в CRM по этой стадии, но stage_id так и не был найден.
+# Эскалация теперь идёт напрямую в WhatsApp Артёму (send_whatsapp_escalation) — CRM-стадия не нужна.
+
+INVOLVEMENT_TRIGGERS: dict[str, list[str]] = {
+    "перенос даты обучения": [
+        "перенести дату", "поменять дату", "другой поток", "следующий поток",
+        "сдвинуть дату", "перевести на другой поток",
+    ],
+    "возврат оплаты за курс": [
+        "вернуть деньги", "возврат денег", "возврат оплаты",
+        "хочу вернуть", "верните деньги", "вернуть оплату",
+    ],
+    "вопрос по уже оплаченному курсу": [
+        "уже оплатил", "уже оплатила", "я оплатил курс",
+        "я уже записан", "уже записана на курс",
+    ],
+    "жалоба на преподавателя": [
+        "жалоба на", "недоволен преподавателем", "недовольна преподавателем",
+        "претензия к", "плохой лектор", "преподаватель грубит",
+    ],
+    "не одобрили рассрочку": [
+        "не одобрили", "не одобрил", "отказали в рассрочке",
+        "не дали рассрочку", "рассрочку не дали", "каспи отказал",
+    ],
+}
+
+# Отдельно от вовлечения — клиент утверждает, что оплатил (нужна ручная проверка Kaspi/CRM)
+PAYMENT_CLAIM_KEYWORDS = [
+    "оплатил", "оплатила", "оплатили", "оплата прошла",
+    "перевела деньги", "перевёл деньги", "закинула деньги", "закинул деньги",
+    "скинула деньги", "скинул деньги", "отправил чек", "отправила чек",
+    "вот чек", "деньги отправила", "деньги отправил",
+]
+
+
+def detect_payment_claim(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in PAYMENT_CLAIM_KEYWORDS)
+
+# ---------- Напоминания после демо ----------
+REMINDER_DELAYS = [
+    (3600,  "reminder_1h"),
+    (10800, "reminder_3h"),
+    (36000, "reminder_10h"),
+]
+
+REMINDER_TEXTS = {
+    "reminder_1h":  "Как впечатления от платформы? Если есть вопросы — я на связи 😊",
+    "reminder_3h":  "Луна напоминает: вы можете начать обучение уже сейчас 🎓 Хотите, помогу подобрать оптимальный вариант?",
+    "reminder_10h": "Подскажите, удалось посмотреть материалы? Могу проконсультировать по обучению или по оплате 😊",
+}
 
 CLAUDE_FALLBACK = {
     "ru": "Извините, небольшой сбой. Напишите позже или менеджер свяжется с Вами 😊",
     "kz": "Кешіріңіз, қате болды. Кейінірек жазыңыз 😊",
-}
-
-THANKS_MSGS = {
-    "ru": "Спасибо! Передала Ваш номер менеджеру — скоро свяжутся 🙌",
-    "kz": "Рахмет! Нөміріңізді менеджерімізге бердім, жақын арада байланысады 🙌",
 }
 
 FAREWELL_MSGS = {
@@ -77,12 +119,8 @@ FAREWELL_MSGS = {
 }
 
 REFUSE_WORDS = [
-    # RU
     "не надо", "не интересно", "нет спасибо", "не хочу", "не нужно",
-    # KZ
     "қажет емес", "жоқ рахмет",
-    # EN
-    "no thanks", "not interested", "don't need",
 ]
 
 PHONE_RE = re.compile(
@@ -90,26 +128,30 @@ PHONE_RE = re.compile(
     r'|\b\d{10,11}\b'
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+SMM_KEYWORDS = [
+    "штат моделей", "съёмк", "съемк", "смм менеджер",
+    "сотрудничеств", "исходник", "модел",
+]
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 db_pool: asyncpg.Pool | None = None
+scheduler: AsyncIOScheduler | None = None
+http_session: aiohttp.ClientSession | None = None
 processed_message_ids: deque = deque(maxlen=1000)
-call_triggered_chat_ids: deque[str] = deque(maxlen=5000)
-sent_texts: dict[str, dict[str, datetime]] = {}  # chat_id → {text: added_at}
+sent_texts: dict[str, dict[str, datetime]] = {}
 dialog_locks: OrderedDict = OrderedDict()
-last_notify: dict[str, datetime] = {}  # chat_id → время последнего notify_manager
-last_bot_reply: dict[str, str] = {}   # chat_id → последний текст, отправленный Лолой
+last_notify: dict[str, datetime] = {}
+last_bot_reply: dict[str, str] = {}
 
-ASTANA_TZ = timezone(timedelta(hours=5))  # Казахстан UTC+5, без перехода на летнее время
-# Авто-пауза WhatsApp по ночному расписанию (23:00–09:00 Алматы). Отдельный
-# флаг от ручного BOT_PAUSED_WHATSAPP (env) — объединяются через OR в
-# envy_hook_handler, поэтому эта задача никогда не снимает ручную дневную
-# паузу раньше времени, а только управляет своим собственным флагом.
-whatsapp_auto_paused = False
+# Дедап пачки сообщений, пришедших почти одновременно от одного контакта
+# (например Instagram шлёт текст + вложение + повтор отдельными вебхуками)
+DEBOUNCE_SECONDS = 4.0
+pending_buffer: dict[str, list[str]] = {}
+pending_tasks: dict[str, asyncio.Task] = {}
+
+MAX_HISTORY = 20
 
 
 def should_notify(chat_id: str, cooldown_seconds: int = 300) -> bool:
@@ -132,7 +174,20 @@ def get_lock(chat_id: str) -> asyncio.Lock:
     return dialog_locks[chat_id]
 
 
-# ---------- DB helpers ----------
+# ---------- DB ----------
+async def log_message(chat_id: str, role: str, text: str | None) -> None:
+    if not text:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO message_log (chat_id, role, text) VALUES ($1, $2, $3)",
+                chat_id, role, text,
+            )
+    except Exception as e:
+        log.error(f"❌ log_message error {chat_id}: {e}")
+
+
 async def get_state(chat_id: str) -> tuple[str | None, list, datetime | None, int | None]:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -154,14 +209,13 @@ async def set_state(
     async with db_pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO dialogs (chat_id, state, history, deal_id, updated_at, awaiting_reply)
-            VALUES ($1, $2, $3::jsonb, $4, NOW(), FALSE)
+            INSERT INTO dialogs (chat_id, state, history, deal_id, updated_at)
+            VALUES ($1, $2, COALESCE($3::jsonb, '[]'::jsonb), $4, NOW())
             ON CONFLICT (chat_id) DO UPDATE
-                SET state          = EXCLUDED.state,
-                    history        = COALESCE(EXCLUDED.history, dialogs.history),
-                    deal_id        = COALESCE(EXCLUDED.deal_id, dialogs.deal_id),
-                    updated_at     = NOW(),
-                    awaiting_reply = FALSE
+                SET state      = EXCLUDED.state,
+                    history    = COALESCE($3::jsonb, dialogs.history),
+                    deal_id    = COALESCE(EXCLUDED.deal_id, dialogs.deal_id),
+                    updated_at = NOW()
             """,
             chat_id, state, history_json, deal_id,
         )
@@ -173,47 +227,26 @@ async def set_state_guarded(
     history: list | None = None,
     deal_id: int | None = None,
 ) -> None:
-    """Like set_state but won't overwrite a row already in SILENT_STATES."""
     history_json = json.dumps(history, ensure_ascii=False) if history is not None else None
     async with db_pool.acquire() as conn:
-        result = await conn.execute(
+        await conn.execute(
             """
-            INSERT INTO dialogs (chat_id, state, history, deal_id, updated_at, awaiting_reply)
-            VALUES ($1, $2, $3::jsonb, $4, NOW(), FALSE)
+            INSERT INTO dialogs (chat_id, state, history, deal_id, updated_at)
+            VALUES ($1, $2, COALESCE($3::jsonb, '[]'::jsonb), $4, NOW())
             ON CONFLICT (chat_id) DO UPDATE
-                SET state          = EXCLUDED.state,
-                    history        = COALESCE(EXCLUDED.history, dialogs.history),
-                    deal_id        = COALESCE(EXCLUDED.deal_id, dialogs.deal_id),
-                    updated_at     = NOW(),
-                    awaiting_reply = FALSE
+                SET state      = EXCLUDED.state,
+                    history    = COALESCE($3::jsonb, dialogs.history),
+                    deal_id    = COALESCE(EXCLUDED.deal_id, dialogs.deal_id),
+                    updated_at = NOW()
                 WHERE dialogs.state NOT IN ('manager', 'done', 'refused', 'smm')
-                   OR dialogs.updated_at <= NOW() - INTERVAL '30 minutes'
             """,
             chat_id, state, history_json, deal_id,
         )
-        # command tag вида "INSERT 0 N" — N=0 означает, что WHERE заблокировал
-        # UPDATE на конфликте (строка уже была manager/done/refused/smm), и
-        # ни state, ни history в БД в этот раз НЕ сохранились
-        try:
-            affected = int(result.rsplit(" ", 1)[-1])
-        except (ValueError, AttributeError):
-            affected = None
-        if affected == 0:
-            row = await conn.fetchrow(
-                "SELECT state, updated_at FROM dialogs WHERE chat_id=$1", chat_id
-            )
-            log.warning(
-                f"⚠️ set_state_guarded заблокировал запись для {chat_id} "
-                f"(попытка state={state!r}) — в БД state={row['state'] if row else None!r} "
-                f"updated_at={row['updated_at'] if row else None}, "
-                f"история диалога за это сообщение не сохранена"
-            )
 
 
 async def save_pending_message(chat_id: str, text: str) -> None:
-    """Сохраняет сообщение клиента, пришедшее пока бот молчит (STATE_MANAGER, таймаут ещё не истёк).
-    Специально НЕ трогает updated_at — иначе сбросится таймер ожидания менеджера,
-    и фоновая задача resume_unanswered_manager_chats никогда не подхватит этот чат."""
+    """Сохраняет сообщение клиента пришедшее пока бот молчит (STATE_MANAGER).
+    НЕ трогает updated_at — иначе сбросится таймер ожидания менеджера."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT history FROM dialogs WHERE chat_id=$1", chat_id)
         history = json.loads(row["history"]) if row and row["history"] else []
@@ -233,30 +266,21 @@ async def clear_awaiting_reply(chat_id: str) -> None:
 async def save_deal_id(chat_id: str, deal_id: int) -> None:
     async with db_pool.acquire() as conn:
         await conn.execute(
-            "UPDATE dialogs SET deal_id = $1 WHERE chat_id = $2",
-            deal_id, chat_id,
+            "UPDATE dialogs SET deal_id = $1 WHERE chat_id = $2", deal_id, chat_id,
         )
 
 
-# ---------- Wazzup API (3 попытки: 0 / 2 / 4 сек) ----------
+# ---------- Wazzup ----------
 async def send_wazzup(chat_id: str, text: str) -> None:
     url = "https://api.wazzup24.com/v3/message"
     headers = {
         "Authorization": f"Bearer {WAZZUP_API_KEY}",
         "Content-Type": "application/json",
     }
-    if chat_id.startswith("wapp-"):
-        channel_id = WAZZUP_WHATSAPP_CHANNEL_ID
-        chat_type = "whatsapp"
-        chat_id = chat_id[5:]  # strip wapp- prefix for Wazzup API
-    else:
-        channel_id = WAZZUP_INSTAGRAM_CHANNEL_ID
-        chat_type = "instagram"
-    # chatId — всегда username как есть (строка), никогда не конвертировать
     body = {
-        "channelId": channel_id,
+        "channelId": WAZZUP_INSTAGRAM_CHANNEL_ID,
         "chatId": chat_id,
-        "chatType": chat_type,
+        "chatType": "instagram",
         "text": text,
     }
     delays = [0, 2, 4]
@@ -264,58 +288,91 @@ async def send_wazzup(chat_id: str, text: str) -> None:
         if delay:
             await asyncio.sleep(delay)
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=body, headers=headers) as resp:
-                    result = await resp.text()
-                    log.info(
-                        f"📤 Wazzup → {chat_id} attempt={attempt + 1} "
-                        f"[{resp.status}]: {result[:200]}"
-                    )
-                    if resp.status < 500:
-                        now = datetime.now(timezone.utc)
-                        bucket = sent_texts.setdefault(chat_id, {})
-                        expired = [t for t, ts in bucket.items() if (now - ts).total_seconds() > 3600]
-                        for t in expired:
-                            del bucket[t]
-                        if len(bucket) >= 1000:
-                            oldest = sorted(bucket, key=lambda t: bucket[t])[:len(bucket) - 999]
-                            for t in oldest:
-                                del bucket[t]
-                        bucket[text] = now
-                        return
-                    log.warning(f"⚠️ Wazzup attempt {attempt + 1} status={resp.status}")
+            async with http_session.post(url, json=body, headers=headers) as resp:
+                result = await resp.text()
+                log.info(f"📤 Wazzup → {chat_id} attempt={attempt+1} [{resp.status}]: {result[:200]}")
+                if resp.status < 500:
+                    now = datetime.now(timezone.utc)
+                    bucket = sent_texts.setdefault(chat_id, {})
+                    expired = [t for t, ts in bucket.items() if (now - ts).total_seconds() > 3600]
+                    for t in expired:
+                        del bucket[t]
+                    bucket[text] = now
+                    return
         except Exception as e:
-            log.warning(f"⚠️ Wazzup attempt {attempt + 1} error: {e}")
+            log.warning(f"⚠️ Wazzup attempt {attempt+1} error: {e}")
     log.error(f"❌ Wazzup: все 3 попытки провалились для {chat_id}")
 
 
-# ---------- EnvyCRM API ----------
+# ---------- APScheduler: напоминания после демо ----------
+async def send_reminder(chat_id: str, reminder_key: str) -> None:
+    try:
+        state, _, _, _ = await get_state(chat_id)
+        if state != STATE_DEMO_SENT:
+            log.info(f"⏭️ Напоминание {reminder_key} для {chat_id} отменено (state={state})")
+            return
+        text = REMINDER_TEXTS.get(reminder_key, "")
+        if not text:
+            return
+        log.info(f"🔔 Отправляю напоминание {reminder_key} → {chat_id}")
+        await send_wazzup(chat_id, text)
+        state2, history, _, deal_id = await get_state(chat_id)
+        history.append({"role": "assistant", "content": text})
+        await set_state(chat_id, STATE_DEMO_SENT, history=history, deal_id=deal_id)
+    except Exception as e:
+        log.error(f"❌ send_reminder {reminder_key} {chat_id}: {e}")
+
+
+def schedule_reminders(chat_id: str) -> None:
+    if scheduler is None:
+        return
+    now = datetime.now(timezone.utc)
+    for delay_sec, reminder_key in REMINDER_DELAYS:
+        run_time = now + timedelta(seconds=delay_sec)
+        job_id = f"{chat_id}_{reminder_key}"
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+        scheduler.add_job(
+            send_reminder,
+            "date",
+            run_date=run_time,
+            args=[chat_id, reminder_key],
+            id=job_id,
+            replace_existing=True,
+        )
+
+
+def cancel_reminders(chat_id: str) -> None:
+    if scheduler is None:
+        return
+    for _, reminder_key in REMINDER_DELAYS:
+        job_id = f"{chat_id}_{reminder_key}"
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+            log.info(f"🗑️ Отменено напоминание {reminder_key} для {chat_id}")
+
+
+# ---------- EnvyCRM ----------
 async def find_lead(username: str, phone: str | None = None, retries: int = 3, delay: float = 3.0) -> int | None:
     url = f"{ENVY_CRM_URL}/openapi/v1/lead/list?api_key={ENVY_API_KEY}"
     headers = {"Content-Type": "application/json"}
     body = {"limit": 1, "inputs": {"phone": phone}} if phone else {"limit": 1, "keyword": username}
     for attempt in range(retries):
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=body, headers=headers) as resp:
-                    raw = await resp.text()
-                    log.info(f"🔍 find_lead attempt={attempt+1} raw [{resp.status}]: {raw[:300]}")
-                    data = json.loads(raw) if raw else {}
-                    leads_data = data.get("leads") or {}
-                    result = leads_data.get("result") or []
-                    if result:
-                        lead_id = result[0]["id"]
-                        log.info(f"🔍 find_lead username={username} phone={phone} → lead_id={lead_id}")
-                        return lead_id
-                    all_ids = leads_data.get("all_ids") or []
-                    if all_ids and attempt == retries - 1:
-                        log.warning(f"⚠️ find_lead: result пуст, но all_ids есть ({all_ids[0]}), используем как fallback")
-                        return all_ids[0]
+            async with http_session.post(url, json=body, headers=headers) as resp:
+                raw = await resp.text()
+                data = json.loads(raw) if raw else {}
+                leads_data = data.get("leads") or {}
+                result = leads_data.get("result") or []
+                if result:
+                    return result[0]["id"]
+                all_ids = leads_data.get("all_ids") or []
+                if all_ids and attempt == retries - 1:
+                    return all_ids[0]
         except Exception as e:
             log.error(f"❌ find_lead error attempt={attempt+1}: {e}")
         if attempt < retries - 1:
             await asyncio.sleep(delay)
-    log.warning(f"⚠️ find_lead: лид не найден после {retries} попыток для username={username}")
     return None
 
 
@@ -324,10 +381,8 @@ async def create_lead_log(lead_id: int, comment: str) -> None:
         url = f"{ENVY_CRM_URL}/openapi/v1/lead/log/create?api_key={ENVY_API_KEY}"
         headers = {"Content-Type": "application/json"}
         body = {"lead_id": lead_id, "type_id": 10, "data": {"comment": comment}}
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=body, headers=headers) as resp:
-                result = await resp.text()
-                log.info(f"📝 create_lead_log lead_id={lead_id} [{resp.status}]: {result[:200]}")
+        async with http_session.post(url, json=body, headers=headers) as resp:
+            log.info(f"📝 create_lead_log lead_id={lead_id} [{resp.status}]")
     except Exception as e:
         log.error(f"❌ create_lead_log error: {e}")
 
@@ -339,259 +394,163 @@ async def lead_to_inbox(lead_id: int, chat_id: str, known_deal_id: int | None = 
 
         if not deal_id:
             url1 = f"{ENVY_CRM_URL}/openapi/v1/lead/get?api_key={ENVY_API_KEY}"
-            body1 = {"lead_id": lead_id}
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url1, json=body1, headers=headers) as resp:
-                    data = await resp.json()
-                    log.info(f"🔎 lead/get [{resp.status}]: {json.dumps(data, ensure_ascii=False)[:1000]}")
-                    deals = data.get("result", {}).get("deals") or []
-                    if deals:
-                        deal_id = deals[0]
-                        log.info(f"✅ lead/get извлечён deal_id={deal_id}")
-                        await save_deal_id(chat_id, deal_id)
+            async with http_session.post(url1, json={"lead_id": lead_id}, headers=headers) as resp:
+                data = await resp.json()
+                deals = data.get("result", {}).get("deals") or []
+                if deals:
+                    deal_id = deals[0]
+                    await save_deal_id(chat_id, deal_id)
 
-        if not deal_id:
+        if not deal_id and REAL_MANAGERS:
             random_employee_id = random.choice(REAL_MANAGERS)
             url_start = f"{ENVY_CRM_URL}/openapi/v1/lead/start?api_key={ENVY_API_KEY}"
-            body_start = {"lead_id": lead_id, "user_id": 346511, "employee_id": random_employee_id}
-            log.info(f"🎲 Случайный менеджер для lead/start: {random_employee_id}")
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url_start, json=body_start, headers=headers) as resp:
-                    data = await resp.json()
-                    log.info(f"🚀 lead/start [{resp.status}]: {json.dumps(data, ensure_ascii=False)[:500]}")
-                    new_deal_id = (data.get("result") or {}).get("deal_id")
-                    if new_deal_id:
-                        deal_id = new_deal_id
-                        log.info(f"✅ lead/start deal_id={deal_id}")
-                        await save_deal_id(chat_id, deal_id)
+            body_start = {"lead_id": lead_id, "employee_id": random_employee_id}
+            async with http_session.post(url_start, json=body_start, headers=headers) as resp:
+                data = await resp.json()
+                new_deal_id = (data.get("result") or {}).get("deal_id")
+                if new_deal_id:
+                    deal_id = new_deal_id
+                    await save_deal_id(chat_id, deal_id)
 
         if not deal_id:
-            log.warning(f"⚠️ lead_to_inbox: нет deal_id для lead_id={lead_id}, пропускаем toInbox")
+            log.warning(f"⚠️ lead_to_inbox: нет deal_id для lead_id={lead_id}")
             return
 
         url2 = f"{ENVY_CRM_URL}/openapi/v1/deal/toInbox?api_key={ENVY_API_KEY}"
-        body2 = {"deal_id": deal_id}
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url2, json=body2, headers=headers) as resp:
-                result = await resp.text()
-                log.info(f"📥 deal/toInbox deal_id={deal_id} [{resp.status}]: {result[:200]}")
+        async with http_session.post(url2, json={"deal_id": deal_id}, headers=headers) as resp:
+            log.info(f"📥 deal/toInbox deal_id={deal_id} [{resp.status}]")
     except Exception as e:
         log.error(f"❌ lead_to_inbox error: {e}")
 
 
-# ---------- Sipuni (callback-звонок при новом лиде, очередь "Горячая база") ----------
-# call_tree не используется: код схемы живёт в недокументированном формате (000-XXXXXX),
-# у нас его нет, и метод не запускал реальных звонков несмотря на success:true от API
-# (проверено эмпирически через statistic/export — звонков с этими id не существовало).
-# Вместо этого — call_number (задокументирован, подтверждён рабочим вживую) с ручным
-# retry-циклом по очереди менеджеров.
-SIPUNI_QUEUE_SIPNUMBERS = ["250", "265", "273", "277", "282", "287", "201"]  # Алуа → Нурзат → Дамира → Диляра → Расул → Тамирлан → Нина
-SIPUNI_RING_WAIT_SECONDS = 20      # сколько ждём ответа одного менеджера, прежде чем пробовать следующего
-SIPUNI_STATS_CHECK_DELAY = 45      # задержка перед проверкой statistic/export (индексации нужно время — проверено эмпирически, 25 сек не хватает)
 
-
-async def sipuni_call_number(client_phone: str, sipnumber: str) -> bool:
-    """Один звонок через call_number: sipnumber → после ответа → client_phone.
-    Возвращает True, если Sipuni приняла запрос (HTTP 200, success=true).
-    Это НЕ значит, что трубку взяли — только что запрос ушёл корректно."""
-    antiaon = "0"
-    reverse = "0"
-    hash_string = f"{antiaon}+{client_phone}+{reverse}+{sipnumber}+{SIPUNI_USER}+{SIPUNI_SECRET}"
-    call_hash = hashlib.md5(hash_string.encode("utf-8")).hexdigest()
-    data = {
-        "antiaon": antiaon,
-        "phone": client_phone,
-        "reverse": reverse,
-        "sipnumber": sipnumber,
-        "user": SIPUNI_USER,
-        "hash": call_hash,
+# ---------- Wazzup: WhatsApp-уведомления Артёму ----------
+async def send_whatsapp_to_manager(text: str) -> None:
+    url = "https://api.wazzup24.com/v3/message"
+    headers = {
+        "Authorization": f"Bearer {WAZZUP_API_KEY}",
+        "Content-Type": "application/json",
     }
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post("https://sipuni.com/api/callback/call_number", data=data)
-            log.info(f"📞 Sipuni call_number sipnumber={sipnumber} client={client_phone} [{resp.status_code}]: {resp.text[:200]}")
-            return resp.status_code == 200
-    except Exception as e:
-        log.error(f"❌ Sipuni call_number error sipnumber={sipnumber}: {e}")
-        return False
-
-
-async def sipuni_check_answered(sipnumber: str, client_phone: str, since_minutes: int = 3) -> bool:
-    """Проверяет через statistic/export, был ли звонок sipnumber → client_phone
-    принят за последние since_minutes минут. Критерий приёма — непустая
-    колонка "Кто ответил" (8-я по счёту, индекс 8, в CSV с разделителем ';').
-    Матчим строку по паттерну "{sipnumber} (" в поле "Откуда" и точному
-    совпадению "Куда" == client_phone."""
-    today = datetime.now(ASTANA_TZ).strftime("%d.%m.%Y")
-    params = {
-        "anonymous": "0", "crmLinks": "0", "dtmfUserAnswer": "0", "firstTime": "0",
-        "from": today, "fromNumber": "", "hangupinitor": "0", "ignoreSpecChar": "0",
-        "names": "1", "numbersInvolved": "1", "numbersRinged": "1", "outgoingLine": "0",
-        "rating": "0", "showTreeId": "0", "state": "0", "timeFrom": "", "timeTo": "",
-        "to": today, "toAnswer": "", "toNumber": "", "tree": "", "type": "0",
-        "user": SIPUNI_USER,
+    body = {
+        "channelId": WAZZUP_WHATSAPP_CHANNEL_ID,
+        "chatId": ARTYOM_WHATSAPP_PERSONAL.lstrip("+"),
+        "chatType": "whatsapp",
+        "text": text,
     }
-    order = ["anonymous", "crmLinks", "dtmfUserAnswer", "firstTime", "from", "fromNumber",
-             "hangupinitor", "ignoreSpecChar", "names", "numbersInvolved", "numbersRinged",
-             "outgoingLine", "rating", "showTreeId", "state", "timeFrom", "timeTo", "to",
-             "toAnswer", "toNumber", "tree", "type", "user"]
-    hash_string = "+".join(params[k] for k in order) + f"+{SIPUNI_SECRET}"
-    params["hash"] = hashlib.md5(hash_string.encode("utf-8")).hexdigest()
+    delays = [0, 2, 4]
+    for attempt, delay in enumerate(delays):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            async with http_session.post(url, json=body, headers=headers) as resp:
+                result = await resp.text()
+                log.info(f"📲 WhatsApp → Артём attempt={attempt+1} [{resp.status}]: {result[:200]}")
+                if resp.status < 500:
+                    return
+        except Exception as e:
+            log.warning(f"⚠️ WhatsApp → Артём attempt {attempt+1} error: {e}")
+    log.error("❌ WhatsApp → Артём: все 3 попытки провалились")
+
+
+UNKNOWN_ANSWER_MARKER = "передала ваш вопрос менеджеру"
+
+
+def detect_unknown_answer(reply: str) -> bool:
+    return UNKNOWN_ANSWER_MARKER in (reply or "").lower()
+
+
+async def extract_client_info(history: list) -> tuple[str | None, str | None]:
+    """Пытается вытащить имя и телефон клиента из истории диалога через Claude
+    (дёшево — Haiku, вызывается только когда реально нужно для уведомления)."""
+    if not history:
+        return None, None
+    transcript = "\n".join(
+        f"{'Клиент' if m.get('role') == 'user' else 'Луна'}: {m.get('content', '')}"
+        for m in history[-20:]
+    )
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post("https://sipuni.com/api/statistic/export", data=params)
-        cutoff = datetime.now(ASTANA_TZ) - timedelta(minutes=since_minutes)
-        for line in resp.text.splitlines()[1:]:  # первая строка — заголовок
-            cols = line.split(";")
-            if len(cols) < 9:
-                continue
-            call_time_str, otkuda, kuda, kto_otvetil = cols[2], cols[4], cols[5], cols[8]
-            if f"{sipnumber} (" not in otkuda:
-                continue
-            if kuda.strip() != client_phone:
-                continue
-            try:
-                call_time = datetime.strptime(call_time_str, "%d.%m.%Y %H:%M:%S").replace(tzinfo=ASTANA_TZ)
-            except ValueError:
-                continue
-            if call_time < cutoff:
-                continue
-            if kto_otvetil.strip():
-                return True
-        return False
+        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        msg = await client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=100,
+            temperature=0,
+            system=(
+                "Извлеки из диалога имя клиента и номер телефона, если они там названы. "
+                'Ответь СТРОГО в формате JSON: {"name": "...", "phone": "..."} '
+                'Если чего-то нет — null вместо значения. Больше ничего не пиши.'
+            ),
+            messages=[{"role": "user", "content": transcript}],
+        )
+        raw = msg.content[0].text.strip()
+        raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+        data = json.loads(raw)
+        return data.get("name"), data.get("phone")
     except Exception as e:
-        log.error(f"❌ Sipuni statistic/export error: {e}")
-        return False  # при ошибке проверки считаем "не ответили" — пойдём к следующему в очереди, не зависнем
+        log.error(f"❌ extract_client_info error: {e}")
+        return None, None
 
 
-def is_within_callback_hours() -> bool:
-    """Callback-звонки работают только 09:00–22:00 Astana time."""
-    now = datetime.now(ASTANA_TZ)
-    return 9 <= now.hour < 22
+async def send_unknown_question_notification(chat_id: str, client_text: str, history: list) -> None:
+    """Луна не знает ответа и пообещала клиенту связь с менеджером — уведомляем Артёма."""
+    name, phone = await extract_client_info(history)
+    ig_link = f"https://instagram.com/{chat_id}"
+    lines = [
+        "❓ Луна не смогла ответить — обещала связь с менеджером",
+        "",
+        f"Instagram: @{chat_id} ({ig_link})",
+    ]
+    if name:
+        lines.append(f"Имя: {name}")
+    if phone:
+        lines.append(f"Телефон: {phone}")
+    lines.append(f"Вопрос клиента: «{client_text[:300]}»")
+    await send_whatsapp_to_manager("\n".join(lines))
 
 
-def should_trigger_call(chat_id: str) -> bool:
-    """Возвращает True и атомарно помечает chat_id как обработанный, если
-    звонок для этого лида ещё не запускали. Не зависит от state/history
-    диалога — работает и во время паузы бота, когда _handle_incoming не
-    выполняется и не может сам это зафиксировать.
-
-    Важная оговорка: это in-memory структура — при рестарте/редеплое на
-    Railway она обнуляется. Если редеплой произойдёт ровно в момент, когда
-    лид уже "видел" хук, но не успел получить звонок — теоретически
-    возможен один лишний повторный звонок после рестарта. Это разовый,
-    редкий, не критичный сценарий — осознанно принимаем этот компромисс
-    ради простоты, не городим ради этого отдельную таблицу в БД.
-    """
-    if chat_id in call_triggered_chat_ids:
-        return False
-    call_triggered_chat_ids.append(chat_id)
-    return True
+whatsapp_escalated: set[str] = set()  # чтобы не слать уведомление повторно по одной и той же теме в диалоге
 
 
-async def has_existing_lead_in_crm(client_phone: str) -> bool:
-    """Проверяет через EnvyCRM /lead/search, есть ли уже лид на этот
-    номер телефона — независимо от того, писал ли человек раньше именно
-    в наш WhatsApp/Instagram бот. Нужно, чтобы не звонить как "новому"
-    тем, кто уже клиент компании, но впервые написал боту.
-
-    Формат подтверждён вручную через Swagger: тело запроса — ТОЛЬКО
-    phone, без email/name (даже пустыми — иначе метод возвращает
-    нерелевантные результаты). Ответ: {"leads": [...]} если найдено,
-    {"leads": []} если нет.
-    При ошибке запроса — возвращает True (осторожная сторона: лучше
-    один раз не позвонить настоящему новому лиду из-за сетевого сбоя,
-    чем повторно спровоцировать жалобу "звоните нашим клиентам")."""
-    url = f"{ENVY_CRM_URL}/openapi/v1/lead/search?api_key={ENVY_API_KEY}"
-    body = {"phone": client_phone}  # ТОЛЬКО phone, не добавлять email/name даже пустыми строками
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                data = await resp.json()
-                leads = data.get("leads") or []
-                found = bool(leads)
-                log.info(f"🔍 EnvyCRM lead/search phone={client_phone}: {'найден существующий лид' if found else 'не найден, реально новый'}")
-                return found
-    except Exception as e:
-        log.error(f"❌ EnvyCRM lead/search error phone={client_phone}: {e} — считаем как 'уже есть', звонок не запускаем на всякий случай")
-        return True
-
-
-async def trigger_new_lead_callback(chat_id: str, client_phone: str) -> None:
-    """Обходит очередь "Горячая база" по порядку (250→265→273→277→282→287→201).
-    Звонит каждому, ждёт SIPUNI_RING_WAIT_SECONDS, проверяет через
-    statistic/export — ответили или нет. Останавливается на первом, кто
-    ответил, либо после того как обзвонит всех 7."""
-    if not SIPUNI_CALLS_ENABLED:
-        log.info(f"🔕 {chat_id} — звонки отключены (SIPUNI_CALLS_ENABLED=false), пропускаем")
+async def send_whatsapp_escalation(chat_id: str, category: str, client_text: str) -> None:
+    """Гарантированно (не полагаясь на LLM) уведомляет Артёма в WhatsApp
+    при триггерной теме — перенос/возврат/оплата/сертификат."""
+    dedup_key = f"{chat_id}:{category}"
+    if dedup_key in whatsapp_escalated:
         return
-    if not is_within_callback_hours():
-        log.info(f"🌙 {chat_id} — новый лид вне окна 09:00–22:00, Sipuni-обзвон пропущен")
+    whatsapp_escalated.add(dedup_key)
+    if len(whatsapp_escalated) > 10000:
+        whatsapp_escalated.clear()
+
+    ig_link = f"https://instagram.com/{chat_id}"
+    text = (
+        f"🙋 Луна: клиент требует вовлечения ({category})\n\n"
+        f"Instagram: @{chat_id} ({ig_link})\n"
+        f"Сообщение клиента: «{client_text[:300]}»"
+    )
+    await send_whatsapp_to_manager(text)
+
+
+payment_notified: set[str] = set()  # чтобы не слать повторно про оплату в одном диалоге
+
+
+async def send_payment_notification(chat_id: str, client_text: str) -> None:
+    """Клиент написал, что оплатил — уведомляем Артёма для ручной проверки в Kaspi/CRM."""
+    if chat_id in payment_notified:
         return
+    payment_notified.add(chat_id)
+    if len(payment_notified) > 10000:
+        payment_notified.clear()
 
-    queue_order = SIPUNI_QUEUE_SIPNUMBERS.copy()
-    random.shuffle(queue_order)
-    for sipnumber in queue_order:
-        ok = await sipuni_call_number(client_phone, sipnumber)
-        if not ok:
-            log.warning(f"⚠️ {chat_id}: запрос на sipnumber={sipnumber} не принят Sipuni, пробуем следующего")
-            continue
-        await asyncio.sleep(SIPUNI_RING_WAIT_SECONDS)
-        # индексации в statistic/export нужно время — ждём отдельно перед проверкой
-        await asyncio.sleep(max(0, SIPUNI_STATS_CHECK_DELAY - SIPUNI_RING_WAIT_SECONDS))
-        answered = await sipuni_check_answered(sipnumber, client_phone)
-        if answered:
-            log.info(f"✅ {chat_id}: звонок принят sipnumber={sipnumber}, клиент={client_phone}")
-            return
-        log.info(f"➡️ {chat_id}: sipnumber={sipnumber} не ответил, следующий в очереди")
-    log.warning(f"❌ {chat_id}: никто из 7 менеджеров не принял звонок, клиент={client_phone}")
-
-
-# ---------- Темы, требующие вовлечения человека: перевод сделки на отдельный этап ----------
-# TODO: вписать реальный stage_id этапа "Требует вовлечения" (воронка "Сделки админов")
-# Узнать так же, как раньше находили 699734: через /deal/list в Swagger или переместив
-# тестовую сделку в этот этап руками и посмотрев её stage_id в ответе.
-INVOLVEMENT_STAGE_ID: int | None = 1780442  # этап "Требует вовлечения", воронка 279133 — подтверждено через /deal/get
-
-# Каждая категория — список ФРАЗ (не отдельных слов), чтобы не ловить обычные
-# разговоры о тарифах/тренерах. Категория матчится, если ЛЮБАЯ из её фраз
-# встречается в тексте клиента (простое вхождение подстроки, без стемминга).
-INVOLVEMENT_TRIGGERS: dict[str, list[str]] = {
-    "заморозка абонемента": ["заморо", "мұздату", "тоңазыт"],
-    "срок действия абонемента": [
-        "сколько осталось", "до какого числа", "когда заканчивается",
-        "срок действия абонемента", "когда истекает", "когда закончится абонемент",
-    ],
-    "проверка гостевых визитов": [
-        "сколько гостевых", "остаток гостевых", "гостевые визиты остались",
-        "проверить гостевые",
-    ],
-    "переоформление абонемента": [
-        "переоформ", "переписать карту", "перевести карту", "передать карту",
-        "перевести абонемент на", "отдать абонемент",
-    ],
-    "возврат абонемента": [
-        "возврат", "вернуть абонемент", "хочу вернуть деньги",
-        "верните деньги", "верните мне деньги", "забрать деньги назад",
-    ],
-    "коммунальные проблемы на филиале": [
-        "нет воды", "нет света", "отключили воду", "отключили свет",
-        "без воды", "без света",
-    ],
-    "подбор тренера (действующий клиент)": [
-        "подобрать тренера", "подберите тренера", "какой тренер свободен",
-        "записаться к тренеру", "хочу сменить тренера",
-    ],
-    "потерянные вещи на филиале": [
-        "потерял в зале", "потеряла в зале", "забыл на филиале", "забыла на филиале",
-        "забыл в зале", "забыла в зале", "потерял на филиале", "потеряла на филиале",
-    ],
-}
+    ig_link = f"https://instagram.com/{chat_id}"
+    text = (
+        f"💰 Луна: клиент утверждает, что оплатил(а) — нужна проверка!\n\n"
+        f"Instagram: @{chat_id} ({ig_link})\n"
+        f"Сообщение клиента: «{client_text[:300]}»\n\n"
+        f"Проверьте поступление в Kaspi/CRM и подтвердите клиенту."
+    )
+    await send_whatsapp_to_manager(text)
 
 
 def detect_involvement_category(text: str) -> str | None:
-    """Возвращает название категории, если текст клиента попадает под один
-    из триггеров, требующих подключения человека. Иначе None."""
     t = text.lower()
     for category, phrases in INVOLVEMENT_TRIGGERS.items():
         if any(p in t for p in phrases):
@@ -599,97 +558,18 @@ def detect_involvement_category(text: str) -> str | None:
     return None
 
 
-# Промпт (стоп-правило "ТЕМЫ, ТРЕБУЮЩИЕ ПОДКЛЮЧЕНИЯ ЧЕЛОВЕКА") велит Лоле
-# говорить клиенту, что запрос уже передан администратору — но
-# INVOLVEMENT_TRIGGERS матчит по ФИКСИРОВАННЫМ фразам КЛИЕНТА и не покрывает
-# все формулировки (например общую жалобу на филиал без слов "нет воды/света").
-# Если Лола всё равно даёт это обещание, а keyword-детект по тексту клиента не
-# сработал — эскалируем по факту самого обещания, чтобы оно не было пустым.
-ADMIN_HANDOFF_RE = re.compile(
-    r"запрос\w*\s+(уже\s+)?пере[дт]а\w*|пере[дт]а\w*\s+(ваш\w*\s+)?запрос\w*",
-    re.IGNORECASE,
-)
-
-
-async def update_deal_stage(deal_id: int, stage_id: int, employee_id: int | None = None) -> bool:
-    """Переводит сделку на указанный этап воронки через /deal/updateDealStage.
-    Возвращает True при успехе (200), False при ошибке."""
-    try:
-        headers = {"Content-Type": "application/json"}
-        url = f"{ENVY_CRM_URL}/openapi/v1/deal/updateDealStage?api_key={ENVY_API_KEY}"
-        body = {"deal_id": deal_id, "stage_id": stage_id}
-        if employee_id is not None:
-            body["employee_id"] = employee_id
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=body, headers=headers) as resp:
-                result = await resp.text()
-                log.info(f"🙋 deal/updateDealStage deal_id={deal_id} stage_id={stage_id} [{resp.status}]: {result[:200]}")
-                return resp.status == 200
-    except Exception as e:
-        log.error(f"❌ update_deal_stage error: {e}")
-        return False
-
-
-async def escalate_to_involvement(chat_id: str, username: str, client_text: str, category: str, known_deal_id: int | None = None) -> None:
-    """Переводит сделку на этап 'Требует вовлечения' СРАЗУ, в обход обычного
-    5-минутного отката уведомлений, и пишет в карточку сам текст вопроса клиента
-    и распознанную категорию — чтобы менеджер сразу понимал суть, не читая весь чат."""
-    if INVOLVEMENT_STAGE_ID is None:
-        log.warning("⚠️ escalate_to_involvement: INVOLVEMENT_STAGE_ID не задан, пропускаю перевод в воронку")
-        return
-    try:
-        lead_id = await find_lead(username)
-        if lead_id is None:
-            log.warning(f"⚠️ escalate_to_involvement: лид не найден для username={username}")
-            return
-        await create_lead_log(lead_id, f"🙋 Лола: требует вовлечения ({category}) — «{client_text[:200]}»")
-        headers = {"Content-Type": "application/json"}
-        deal_id = known_deal_id
-
-        if not deal_id:
-            # тот же путь получения deal_id, что и в lead_to_inbox
-            url1 = f"{ENVY_CRM_URL}/openapi/v1/lead/get?api_key={ENVY_API_KEY}"
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url1, json={"lead_id": lead_id}, headers=headers) as resp:
-                    data = await resp.json()
-                    deals = data.get("result", {}).get("deals") or []
-                    if deals:
-                        deal_id = deals[0]
-                        await save_deal_id(chat_id, deal_id)
-
-        if not deal_id:
-            # сделки ещё нет вообще (первое сообщение клиента) — создаём её,
-            # так же как это делает lead_to_inbox, иначе updateDealStage не на чем вызывать
-            random_employee_id = random.choice(REAL_MANAGERS)
-            url_start = f"{ENVY_CRM_URL}/openapi/v1/lead/start?api_key={ENVY_API_KEY}"
-            body_start = {"lead_id": lead_id, "user_id": 346511, "employee_id": random_employee_id}
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url_start, json=body_start, headers=headers) as resp:
-                    data = await resp.json()
-                    new_deal_id = (data.get("result") or {}).get("deal_id")
-                    if new_deal_id:
-                        deal_id = new_deal_id
-                        log.info(f"✅ escalate_to_involvement: lead/start создал deal_id={deal_id}")
-                        await save_deal_id(chat_id, deal_id)
-
-        if deal_id:
-            await update_deal_stage(deal_id, INVOLVEMENT_STAGE_ID)
-        else:
-            log.warning(f"⚠️ escalate_to_involvement: нет deal_id для lead_id={lead_id} даже после lead/start, этап не переключаю")
-    except Exception as e:
-        log.error(f"❌ escalate_to_involvement error: {e}")
-
-
-async def notify_manager(chat_id: str, username: str, phone: str | None = None, known_deal_id: int | None = None) -> None:
+async def notify_manager(
+    chat_id: str, username: str, phone: str | None = None, known_deal_id: int | None = None
+) -> None:
     try:
         lead_id = await find_lead(username, phone)
         if lead_id is None:
-            log.warning(f"⚠️ notify_manager: лид не найден для username={username} phone={phone}")
+            log.warning(f"⚠️ notify_manager: лид не найден username={username}")
             return
         if phone:
-            await create_lead_log(lead_id, f"🤖 Лола: клиент {username} оставил номер {phone}. Позвонить!")
+            await create_lead_log(lead_id, f"🤖 Луна: клиент {username} оставил номер {phone}. Позвонить!")
         else:
-            await create_lead_log(lead_id, f"🤖 Лола: новый клиент {username} написал в Instagram. Проверить диалог.")
+            await create_lead_log(lead_id, f"🤖 Луна: новый клиент {username} написал в Instagram.")
         asyncio.create_task(lead_to_inbox(lead_id, chat_id, known_deal_id))
     except Exception as e:
         log.error(f"❌ notify_manager error: {e}")
@@ -698,29 +578,19 @@ async def notify_manager(chat_id: str, username: str, phone: str | None = None, 
 # ---------- Helpers ----------
 def extract_phone(text: str) -> str | None:
     m = PHONE_RE.search(text)
-    if m:
-        if len(re.sub(r"\D", "", m.group())) >= 10:
-            return m.group()
+    if m and len(re.sub(r"\D", "", m.group())) >= 10:
+        return m.group()
     return None
 
 
 def is_refusal(text: str) -> bool:
     lower = text.lower()
-    for phrase in REFUSE_WORDS:
-        pattern = r'\b' + re.escape(phrase) + r'\b'
-        if re.search(pattern, lower):
-            return True
-    return False
+    return any(re.search(r'\b' + re.escape(p) + r'\b', lower) for p in REFUSE_WORDS)
 
 
 def detect_lang(text: str) -> str:
-    """Простое определение языка по символам и целым словам."""
     kz_chars = set("әіңғүұқөһ")
-    kz_words = {
-        "керек", "емес", "жоқ", "бар", "барып", "журсек",
-        "болмаима", "сурап", "озимиз", "қайда", "қалай",
-        "рахмет", "сәлем", "жақсы", "бұл", "мен", "сен",
-    }
+    kz_words = {"керек", "емес", "жоқ", "бар", "қайда", "қалай", "рахмет", "сәлем", "жақсы", "бұл"}
     lower_text = text.lower()
     if any(c in kz_chars for c in lower_text):
         return "kz"
@@ -730,16 +600,16 @@ def detect_lang(text: str) -> str:
     return "ru"
 
 
-# Оба канала на Haiku 4.5 — дешевле, меньше объём. Sonnet возвращён обратно
-# из-за более высокой стоимости; при необходимости можно завести отдельную
-# логику выбора модели по chat_id.
-def pick_model(chat_id: str) -> str:
-    return "claude-haiku-4-5"
+def detect_demo_sent(reply: str) -> bool:
+    demo_markers = ["skillspace.ru", "championschool.kz", "демо", "demo", "регистрац", "перейти по ссылке"]
+    return any(marker in reply.lower() for marker in demo_markers)
 
 
-async def claude_reply(messages: list[dict], static_prompt: str | None = None, dynamic_context: str = "", model: str = "claude-haiku-4-5") -> str:
+async def claude_reply(messages: list[dict], system_prompt: str | None = None, kb: str | None = None) -> str:
+    # Убираем ведущие assistant-сообщения
     while messages and messages[0].get("role") == "assistant":
         messages = messages[1:]
+    # Убираем подряд идущие одинаковые роли
     cleaned = []
     for msg in messages:
         if cleaned and cleaned[-1]["role"] == msg["role"]:
@@ -750,130 +620,61 @@ async def claude_reply(messages: list[dict], static_prompt: str | None = None, d
         messages = messages[1:]
     if not messages:
         messages = [{"role": "user", "content": "Здравствуйте"}]
-    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-    # Блок 1 — ПОСТОЯННЫЙ текст (правила + база знаний), байт-в-байт одинаковый
-    # на каждом сообщении → кэшируется, читается за 10% цены после первой записи.
-    # Блок 2 — ПЕРЕМЕННЫЙ RAG-контекст, меняется почти каждый раз → без кэша,
-    # но он маленький (0-4 чанка), так что дорого не выходит.
+
+    # Два отдельных кешируемых блока:
+    # Блок 1 — промпт (меняется редко, кеш живёт долго)
+    # Блок 2 — база знаний из Sheets (меняется каждые 30 мин, свой кеш)
     system_blocks = [
         {
             "type": "text",
-            "text": static_prompt or SYSTEM_PROMPT,
+            "text": system_prompt or SYSTEM_PROMPT,
             "cache_control": {"type": "ephemeral"},
-        }
+        },
     ]
-    if dynamic_context:
-        system_blocks.append({"type": "text", "text": dynamic_context})
-    # ВАЖНО: claude-sonnet-5 отклоняет параметр temperature (400 "deprecated for
-    # this model") — передаём его только для Haiku, для Sonnet вообще не указываем.
-    create_kwargs = dict(model=model, max_tokens=1024, system=system_blocks, messages=messages)
-    if model == "claude-haiku-4-5":
-        create_kwargs["temperature"] = 0.2
-    msg = await client.messages.create(**create_kwargs)
-    # ВАЖНО: Sonnet иногда возвращает ThinkingBlock первым элементом content
-    # (режим рассуждения), а не сразу текст — ищем именно текстовый блок,
-    # а не берём content[0] вслепую (это ломало КАЖДЫЙ такой ответ Sonnet).
-    for block in msg.content:
-        if getattr(block, "type", None) == "text":
-            return block.text
-    raise ValueError(f"В ответе Claude не найден текстовый блок: {[getattr(b,'type',None) for b in msg.content]}")
+    if kb:
+        system_blocks.append({
+            "type": "text",
+            "text": "<knowledge_base>\n" + kb + "\n</knowledge_base>",
+            "cache_control": {"type": "ephemeral"},
+        })
 
-
-PRICE_LIKE_RE = re.compile(r"\d{2,3}[.,]?\s?\d{3}\s*тг", re.IGNORECASE)
-
-INSTAGRAM_GATE_FALLBACK = {
-    "ru": "Привет! 👋 Да, у нас как раз есть отличные варианты. Давайте познакомимся — как зовут и номер телефона? 😊",
-    "kz": "Сәлем! 👋 Иә, бізде тиімді ұсыныстар бар. Танысайық — атыңыз және телефон нөміріңіз қандай? 😊",
-}
-
-
-def _history_has_phone(history: list[dict], current_text: str | None = None) -> bool:
-    """Прокси для «контакты уже получены»: был ли номер телефона хоть раз в
-    диалоге (включая текущее сообщение клиента)."""
-    if current_text and extract_phone(current_text):
-        return True
-    for msg in history:
-        if msg.get("role") == "user" and extract_phone(str(msg.get("content", ""))):
-            return True
-    return False
-
-
-async def enforce_instagram_price_gate(
-    chat_id: str,
-    reply: str,
-    history: list[dict],
-    text: str | None,
-    static_prompt: str,
-    dynamic_context: str,
-) -> str:
-    """Программный предохранитель поверх правила «цена только после имени+телефона»
-    для Instagram. Инцидент 07.07 (chat k_akhmetovaaaa и ещё один) показал, что
-    модель иногда нарушает это правило на маркетинговых триггерах, несмотря на то
-    что оно явно прописано в системном промпте с примером ошибки — на промпт
-    полагаться недостаточно. Перехватываем уже сгенерированный ответ: если в нём
-    есть цифры похожие на цену, а контакты (телефон) ещё не получены — просим
-    Claude перегенерировать без цены, а если не получилось — отдаём безопасный
-    заглушечный ответ с вопросом про имя и телефон."""
-    if chat_id.startswith("wapp-"):
-        return reply
-    if not PRICE_LIKE_RE.search(reply) or _history_has_phone(history, text):
-        return reply
-
-    log.warning(f"🚧 INSTAGRAM_PRICE_GATE перехват (цена без контактов) → {chat_id}: {reply[:300]}")
-    reinforced_prompt = static_prompt + (
-        "\n\nСРОЧНОЕ НАПОМИНАНИЕ (сработала программная проверка): твой предыдущий "
-        "вариант ответа содержал цену/цифры до получения имени и номера телефона "
-        "клиента в Instagram — это запрещено. Ответь ЗАНОВО, БЕЗ единой цифры цены "
-        "или названия тарифа — только вопрос про имя и номер телефона."
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    msg = await client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=1024,
+        temperature=0.2,
+        system=system_blocks,
+        messages=messages,
     )
-    try:
-        retry_reply = await claude_reply(history, reinforced_prompt, dynamic_context, model=pick_model(chat_id))
-    except Exception as e:
-        log.error(f"❌ INSTAGRAM_PRICE_GATE: ошибка перегенерации для {chat_id}: {e}")
-        retry_reply = ""
-
-    if retry_reply and retry_reply.strip() and not PRICE_LIKE_RE.search(retry_reply):
-        log.info(f"✅ INSTAGRAM_PRICE_GATE перегенерация без цены прошла успешно → {chat_id}")
-        return retry_reply
-
-    log.warning(f"🚧 INSTAGRAM_PRICE_GATE перегенерация не помогла, отправляю safe-fallback → {chat_id}")
-    return INSTAGRAM_GATE_FALLBACK.get(detect_lang(text or ""), INSTAGRAM_GATE_FALLBACK["ru"])
-
-
-MAX_HISTORY = 20
+    return msg.content[0].text
 
 
 async def transcribe_audio(url: str) -> str | None:
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    log.warning(f"⚠️ transcribe: не удалось скачать аудио [{resp.status}] {url[:100]}")
-                    return None
-                audio_bytes = await resp.read()
+        async with http_session.get(url) as resp:
+            if resp.status != 200:
+                return None
+            audio_bytes = await resp.read()
         buf = io.BytesIO(audio_bytes)
         buf.name = "audio.ogg"
         client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
         result = await client.audio.transcriptions.create(model="whisper-1", file=buf)
-        text = result.text.strip()
-        log.info(f"🎤 Whisper транскрипция: {text[:100]!r}")
-        return text or None
+        return result.text.strip() or None
     except Exception as e:
         log.error(f"❌ transcribe_audio error: {e}")
         return None
 
 
-# ---------- Основная логика диалога ----------
-async def handle_incoming(chat_id: str, text: str | None, client_phone: str | None = None) -> None:
+# ---------- Основная логика ----------
+async def handle_incoming(chat_id: str, text: str | None) -> None:
     async with get_lock(chat_id):
-        await _handle_incoming(chat_id, text, client_phone)
+        await _handle_incoming(chat_id, text)
 
 
-async def _handle_incoming(chat_id: str, text: str | None, client_phone: str | None = None) -> None:
-    base_prompt = WHATSAPP_PROMPT if chat_id.startswith("wapp-") else SYSTEM_PROMPT
-    rag_context = await get_context(text) if text else ""
-    static_prompt = base_prompt + "\n\n<knowledge_base>\n" + get_knowledge_base() + "\n</knowledge_base>"
-    dynamic_context = ("<retrieved_context>\n" + rag_context + "\n</retrieved_context>") if rag_context else ""
+async def _handle_incoming(chat_id: str, text: str | None) -> None:
+    # Два отдельных кешируемых блока: промпт + база знаний
+    kb = sheets_sync.get_cached_knowledge_base(fallback=KNOWLEDGE_BASE)
+
     state, history, updated_at, deal_id = await get_state(chat_id)
 
     if state == STATE_NEW and history and history[0].get("content") == text:
@@ -888,25 +689,17 @@ async def _handle_incoming(chat_id: str, text: str | None, client_phone: str | N
         now = datetime.now(timezone.utc)
         if updated_at:
             elapsed = (now - updated_at).total_seconds()
-            if state == STATE_MANAGER and elapsed >= 1800:  # 30 минут
+            if state == STATE_MANAGER and elapsed >= 1800:  # 30 мин
                 log.info(f"🔄 {chat_id} state=manager устарел (>30мин), сбрасываем")
                 state = None
-                # ВАЖНО: пишем STATE_ACTIVE, а не None — колонка state объявлена
-                # NOT NULL, и запись None здесь всегда падала с NotNullViolationError
-                # (тихо проглатывалась внешним try/except в вебхуке), из-за чего
-                # сброс никогда не сохранялся и история диалога терялась. Запись
-                # валидного состояния сразу же также не даёт повторной проверке
-                # ниже (после ответа Claude) увидеть ту же самую устаревшую запись
-                # "manager" и ложно решить, что менеджер только что взял чат.
-                await set_state(chat_id, STATE_ACTIVE)
-            elif state in {STATE_DONE, STATE_REFUSED} and elapsed >= 3600:  # 1 час
-                log.info(f"🔄 {chat_id} state={state} устарел (>1 часа), сбрасываем")
+            elif state in {STATE_DONE, STATE_REFUSED} and elapsed >= 3600:
+                log.info(f"🔄 {chat_id} state={state} устарел, сбрасываем")
                 state = None
-                await set_state(chat_id, STATE_ACTIVE)  # то же обоснование, см. выше
             else:
                 if state == STATE_MANAGER and text:
+                    # Lesson 11: сохраняем сообщение — ответим сами если менеджер не подключится
                     await save_pending_message(chat_id, text)
-                    log.info(f"💤 {chat_id} state=manager, сообщение сохранено — ответим сами, если менеджер не подключится за 30 мин")
+                    log.info(f"💤 {chat_id} state=manager, сообщение сохранено (ответим через 30 мин)")
                 else:
                     log.info(f"🔇 {chat_id} state={state}, молчим")
                 return
@@ -914,78 +707,93 @@ async def _handle_incoming(chat_id: str, text: str | None, client_phone: str | N
             log.info(f"🔇 {chat_id} state={state}, молчим")
             return
 
-    # Новый диалог — передаём первое сообщение клиента в Claude
+    # Клиент написал сам после демо → отменяем напоминания
+    if state == STATE_DEMO_SENT and text:
+        cancel_reminders(chat_id)
+
+    if text:
+        asyncio.create_task(log_message(chat_id, "user", text))
+
+    # Новый диалог
     if state is None:
         if history is None:
             history = []
         is_truly_new = len(history) == 0
-        # Звонок теперь запускается только один раз, из envy_hook_handler
-        # (до пауза-чека, через should_trigger_call) — независимо от паузы.
         if text:
             history.append({"role": "user", "content": text})
         else:
             history.append({"role": "user", "content": "Здравствуйте"})
         try:
-            reply = await claude_reply(history, static_prompt, dynamic_context, model=pick_model(chat_id))
+            reply = await claude_reply(history, SYSTEM_PROMPT, kb=kb)
             if not reply or not reply.strip():
                 raise ValueError("пустой ответ")
         except Exception as e:
             log.error(f"❌ Claude error on greeting: {e}")
-            lang = detect_lang(text or "")
-            reply = CLAUDE_FALLBACK.get(lang, CLAUDE_FALLBACK["ru"])
-        reply = await enforce_instagram_price_gate(chat_id, reply, history, text, static_prompt, dynamic_context)
+            reply = CLAUDE_FALLBACK.get(detect_lang(text or ""), CLAUDE_FALLBACK["ru"])
+
         history.append({"role": "assistant", "content": reply})
+
+        # Lesson 11: перепроверяем state ПОСЛЕ генерации (гонка с менеджером)
         current_state, _, _, _ = await get_state(chat_id)
         if current_state in SILENT_STATES:
-            if current_state == STATE_MANAGER:
-                log.info(f"🚫 {chat_id} — менеджер взял чат пока Claude думал, отмена отправки")
-            else:
-                log.info(f"🛑 {chat_id} state={current_state} пока Claude отвечал, не отправляем")
+            log.info(f"🚫 {chat_id} — менеджер взял чат пока Claude думал, отмена отправки")
             return
-        if last_bot_reply.get(chat_id) == reply:
-            log.warning(f"⚠️ Повторная отправка того же приветствия подряд для {chat_id}, пропускаем send_wazzup")
-        else:
-            log.info(f"💬 Ответ Лолы → {chat_id}: {reply[:300]}")
-            await send_wazzup(chat_id, reply)
-            if len(last_bot_reply) >= 10000:
-                del last_bot_reply[next(iter(last_bot_reply))]
-            last_bot_reply[chat_id] = reply
+
+        log.info(f"💬 Ответ Луны → {chat_id}: {reply[:300]}")
+        await send_wazzup(chat_id, reply)
+        asyncio.create_task(log_message(chat_id, "assistant", reply))
+        if detect_unknown_answer(reply):
+            asyncio.create_task(
+                send_unknown_question_notification(chat_id, text or "(первое сообщение)", history)
+            )
+        if len(last_bot_reply) >= 10000:
+            del last_bot_reply[next(iter(last_bot_reply))]
+        last_bot_reply[chat_id] = reply
+
         new_state = STATE_NEW if is_truly_new else STATE_ACTIVE
-        await set_state_guarded(chat_id, new_state, history=history)
+        if detect_demo_sent(reply):
+            new_state = STATE_DEMO_SENT
+            await set_state_guarded(chat_id, new_state, history=history)
+            schedule_reminders(chat_id)
+        else:
+            await set_state_guarded(chat_id, new_state, history=history)
+
         if should_notify(chat_id):
             asyncio.create_task(notify_manager(chat_id, chat_id, known_deal_id=deal_id))
-        escalated = False
+
+        # Lesson 9.5: эскалация работает и для ПЕРВОГО сообщения
         if text:
             phone = extract_phone(text)
             if phone:
                 asyncio.create_task(notify_manager(chat_id, chat_id, phone, known_deal_id=deal_id))
-                log.info(f"📞 {chat_id} дал телефон={phone} первым сообщением")
             involvement_category = detect_involvement_category(text)
             if involvement_category:
-                asyncio.create_task(escalate_to_involvement(chat_id, chat_id, text, involvement_category, known_deal_id=deal_id))
-                log.info(f"🙋 {chat_id} требует вовлечения ({involvement_category}) — первым сообщением, эскалирую")
-                escalated = True
-        if not escalated and ADMIN_HANDOFF_RE.search(reply):
-            asyncio.create_task(escalate_to_involvement(
-                chat_id, chat_id, text or reply, "Лола пообещала передачу администратору", known_deal_id=deal_id
-            ))
-            log.info(f"🙋 {chat_id} Лола пообещала передачу администратору — эскалирую по факту ответа")
+                asyncio.create_task(send_whatsapp_escalation(chat_id, involvement_category, text))
+                log.info(f"🙋 {chat_id} требует вовлечения ({involvement_category}) — первым сообщением")
+            if detect_payment_claim(text):
+                asyncio.create_task(send_payment_notification(chat_id, text))
+                log.info(f"💰 {chat_id} утверждает, что оплатил — первым сообщением")
+
         log.info(f"👋 {'Новый' if is_truly_new else 'Возобновлённый'} диалог {chat_id} → {new_state}")
         return
 
-    # state = "new" или "active" — нужен текст клиента
+    # state = new / active / demo_sent — нужен текст
     if not text:
         return
 
     phone = extract_phone(text)
     if phone:
         asyncio.create_task(notify_manager(chat_id, chat_id, phone, known_deal_id=deal_id))
-        log.info(f"📞 {chat_id} дал телефон={phone}, продолжаем воронку")
 
+    # Lesson 9.5: эскалация для всех состояний
     involvement_category = detect_involvement_category(text)
     if involvement_category:
-        asyncio.create_task(escalate_to_involvement(chat_id, chat_id, text, involvement_category, known_deal_id=deal_id))
-        log.info(f"🙋 {chat_id} требует вовлечения ({involvement_category}) — эскалирую")
+        asyncio.create_task(send_whatsapp_escalation(chat_id, involvement_category, text))
+        log.info(f"🙋 {chat_id} требует вовлечения ({involvement_category})")
+
+    if detect_payment_claim(text):
+        asyncio.create_task(send_payment_notification(chat_id, text))
+        log.info(f"💰 {chat_id} утверждает, что оплатил")
 
     if is_refusal(text):
         lang = detect_lang(text)
@@ -993,103 +801,92 @@ async def _handle_incoming(chat_id: str, text: str | None, client_phone: str | N
         history.append({"role": "user", "content": text})
         history.append({"role": "assistant", "content": farewell})
         await send_wazzup(chat_id, farewell)
+        asyncio.create_task(log_message(chat_id, "assistant", farewell))
         await set_state(chat_id, STATE_REFUSED, history=history)
-        log.info(f"🚫 {chat_id} отказался lang={lang} → STATE_REFUSED")
+        cancel_reminders(chat_id)
         return
 
-    # Добавляем сообщение клиента, обрезаем до MAX_HISTORY перед отправкой в Claude
     history.append({"role": "user", "content": text})
     history = history[-MAX_HISTORY:]
 
     try:
-        reply = await claude_reply(history, static_prompt, dynamic_context, model=pick_model(chat_id))
+        reply = await claude_reply(history, SYSTEM_PROMPT, kb=kb)
         if not reply or not reply.strip():
             raise ValueError("пустой ответ")
     except Exception as e:
         log.error(f"❌ Claude error: {e}")
         reply = CLAUDE_FALLBACK.get(detect_lang(text or ""), CLAUDE_FALLBACK["ru"])
 
-    reply = await enforce_instagram_price_gate(chat_id, reply, history, text, static_prompt, dynamic_context)
-
-    # Добавляем ответ Лолы и сохраняем
     history.append({"role": "assistant", "content": reply})
     history = history[-MAX_HISTORY:]
 
+    # Lesson 11: перепроверяем state после генерации
     current_state, _, _, _ = await get_state(chat_id)
     if current_state in SILENT_STATES:
-        if current_state == STATE_MANAGER:
-            log.info(f"🚫 {chat_id} — менеджер взял чат пока Claude думал, отмена отправки")
-        else:
-            log.info(f"🛑 {chat_id} state={current_state} пока Claude отвечал, не отправляем")
+        log.info(f"🚫 {chat_id} — менеджер взял чат пока Claude думал, отмена отправки")
         return
 
-    log.info(f"💬 Ответ Лолы → {chat_id}: {reply[:300]}")
+    log.info(f"💬 Ответ Луны → {chat_id}: {reply[:300]}")
     await send_wazzup(chat_id, reply)
+    asyncio.create_task(log_message(chat_id, "assistant", reply))
+    if detect_unknown_answer(reply):
+        asyncio.create_task(send_unknown_question_notification(chat_id, text, history))
     if len(last_bot_reply) >= 10000:
         del last_bot_reply[next(iter(last_bot_reply))]
     last_bot_reply[chat_id] = reply
-    await set_state_guarded(chat_id, STATE_ACTIVE, history=history)
+
+    if detect_demo_sent(reply):
+        await set_state_guarded(chat_id, STATE_DEMO_SENT, history=history)
+        schedule_reminders(chat_id)
+    else:
+        await set_state_guarded(chat_id, STATE_ACTIVE, history=history)
+
     if should_notify(chat_id):
         asyncio.create_task(notify_manager(chat_id, chat_id, known_deal_id=deal_id))
-    if not involvement_category and ADMIN_HANDOFF_RE.search(reply):
-        asyncio.create_task(escalate_to_involvement(
-            chat_id, chat_id, text, "Лола пообещала передачу администратору", known_deal_id=deal_id
-        ))
-        log.info(f"🙋 {chat_id} Лола пообещала передачу администратору — эскалирую по факту ответа")
-    log.info(f"🤖 {chat_id} ответ Claude → STATE_ACTIVE (history={len(history)})")
 
 
-# ---------- Автоответ на сообщения, зависшие в STATE_MANAGER ----------
+# ---------- Автоответ на зависшие в STATE_MANAGER чаты (30 мин) ----------
 async def _answer_pending(chat_id: str) -> None:
-    """Отвечает на сообщение клиента, которое пришло пока бот молчал (STATE_MANAGER),
-    и менеджер за 30 минут так и не подключился. Вызывается из фоновой задачи,
-    а не из вебхука — поэтому клиенту не нужно писать что-то ещё, чтобы получить ответ."""
     state, history, updated_at, deal_id = await get_state(chat_id)
     if state != STATE_MANAGER:
-        return  # кто-то уже обработал этот чат другим путём
-
+        return
     if not history or history[-1].get("role") != "user":
-        # нечего отвечать — просто снимаем флаг, чтобы не проверять чат заново
         await clear_awaiting_reply(chat_id)
         return
 
     text = history[-1].get("content", "")
-    base_prompt = WHATSAPP_PROMPT if chat_id.startswith("wapp-") else SYSTEM_PROMPT
-    rag_context = await get_context(text) if text else ""
-    static_prompt = base_prompt + "\n\n<knowledge_base>\n" + get_knowledge_base() + "\n</knowledge_base>"
-    dynamic_context = ("<retrieved_context>\n" + rag_context + "\n</retrieved_context>") if rag_context else ""
+    kb = sheets_sync.get_cached_knowledge_base(fallback=KNOWLEDGE_BASE)
 
     try:
-        reply = await claude_reply(history, static_prompt, dynamic_context, model=pick_model(chat_id))
+        reply = await claude_reply(history, SYSTEM_PROMPT, kb=kb)
         if not reply or not reply.strip():
             raise ValueError("пустой ответ")
     except Exception as e:
         log.error(f"❌ Claude error on pending reply: {e}")
         reply = CLAUDE_FALLBACK.get(detect_lang(text or ""), CLAUDE_FALLBACK["ru"])
 
-    reply = await enforce_instagram_price_gate(chat_id, reply, history, text, static_prompt, dynamic_context)
-
     history.append({"role": "assistant", "content": reply})
     history = history[-MAX_HISTORY:]
 
-    # менеджер мог перехватить чат ровно пока Claude готовил ответ — перепроверяем
+    # Lesson 11: перепроверяем — менеджер мог взять чат пока Claude думал
     current_state, _, _, _ = await get_state(chat_id)
     if current_state != STATE_MANAGER:
         log.info(f"🛑 {chat_id} — стейт изменился пока готовили отложенный ответ, не отправляем")
         return
 
-    log.info(f"💬 Отложенный ответ Лолы (менеджер не подключился за 30 мин) → {chat_id}: {reply[:300]}")
+    log.info(f"💬 Отложенный ответ Луны (менеджер не подключился за 30 мин) → {chat_id}: {reply[:300]}")
     await send_wazzup(chat_id, reply)
+    asyncio.create_task(log_message(chat_id, "assistant", reply))
+    if detect_unknown_answer(reply):
+        asyncio.create_task(send_unknown_question_notification(chat_id, text, history))
     if len(last_bot_reply) >= 10000:
         del last_bot_reply[next(iter(last_bot_reply))]
     last_bot_reply[chat_id] = reply
     await set_state(chat_id, STATE_ACTIVE, history=history)
-    log.info(f"⏰ {chat_id} — неотвеченное сообщение обработано → STATE_ACTIVE")
 
 
 async def resume_unanswered_manager_chats() -> None:
-    """Раз в минуту проверяет чаты, застрявшие в STATE_MANAGER дольше 30 минут
-    с неотвеченным сообщением клиента, и отвечает сама — не дожидаясь нового сообщения."""
+    """Раз в минуту проверяет чаты в STATE_MANAGER дольше 30 минут с unanswered сообщением."""
     while True:
         await asyncio.sleep(60)
         try:
@@ -1101,37 +898,39 @@ async def resume_unanswered_manager_chats() -> None:
                       AND updated_at <= NOW() - INTERVAL '30 minutes'
                 """)
             for row in rows:
-                chat_id = row["chat_id"]
-                async with get_lock(chat_id):
-                    await _answer_pending(chat_id)
+                cid = row["chat_id"]
+                async with get_lock(cid):
+                    await _answer_pending(cid)
         except Exception as e:
-            log.error(f"⚠️ Ошибка в resume_unanswered_manager_chats: {e}")
-
-
-async def whatsapp_night_schedule_manager() -> None:
-    """Раз в минуту проверяет время по Алматы и включает/выключает дневную
-    авто-паузу WhatsApp (09:00–23:00) — бот работает только 23:00–09:00.
-    Instagram не затрагивает."""
-    global whatsapp_auto_paused
-    while True:
-        try:
-            now = datetime.now(ASTANA_TZ)
-            should_pause = 9 <= now.hour < 23
-            if should_pause != whatsapp_auto_paused:
-                whatsapp_auto_paused = should_pause
-                if should_pause:
-                    log.info(f"WhatsApp авто-пауза включена (Алматы {now.strftime('%H:%M')})")
-                else:
-                    log.info(f"WhatsApp авто-пауза снята (Алматы {now.strftime('%H:%M')})")
-        except Exception as e:
-            log.error(f"⚠️ Ошибка в whatsapp_night_schedule_manager: {e}")
-        await asyncio.sleep(60)
+            log.error(f"⚠️ resume_unanswered_manager_chats: {e}")
 
 
 # ---------- Эндпоинты ----------
+async def _debounced_handle_incoming(chat_id: str) -> None:
+    """Ждёт DEBOUNCE_SECONDS без новых сообщений от chat_id, затем склеивает
+    всё что накопилось в один текст и обрабатывает разом (одним ответом)."""
+    try:
+        await asyncio.sleep(DEBOUNCE_SECONDS)
+    except asyncio.CancelledError:
+        return  # пришло новое сообщение — таймер перезапущен снаружи
+
+    texts = pending_buffer.pop(chat_id, [])
+    pending_tasks.pop(chat_id, None)
+    if not texts:
+        return
+
+    combined = "\n".join(t for t in texts if t).strip() or None
+    if len(texts) > 1:
+        log.info(f"🧩 Склеено {len(texts)} сообщений от {chat_id} в одно")
+
+    try:
+        await handle_incoming(chat_id, combined)
+    except Exception as e:
+        log.error(f"❌ handle_incoming error {chat_id}: {e}", exc_info=True)
+
+
 async def envy_hook_handler(request: web.Request) -> web.Response:
-    if os.getenv("BOT_PAUSED", "false").lower() == "true":
-        log.info("⏸️ Бот на паузе, игнорируем")
+    if BOT_PAUSED_INSTAGRAM:
         return web.Response(text="ok")
 
     try:
@@ -1139,63 +938,32 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
     except Exception:
         return web.Response(text="ok")
 
-    # Звонок должен уйти независимо от паузы текстовых ответов —
-    # см. комментарий в should_trigger_call выше. Извлекаем облегчённо,
-    # не дублируя полную логику ниже (echo-фильтры, дедуп по message_id
-    # и т.д. тут не нужны — should_trigger_call сама защищает от дублей).
-    if payload.get("event_type") == "message":
-        _contact = payload.get("contact") or {}
-        _chat_id = str(_contact.get("external_id") or "").strip()
-        if _chat_id.startswith("inst-"):
-            _chat_id = _chat_id[5:]
-        _client_phone = _contact.get("phone") or None
-        if not _client_phone and _chat_id.startswith("wapp-"):
-            _client_phone = _chat_id[5:]
-        if _chat_id and _client_phone and should_trigger_call(_chat_id):
-            _state, _history, _, _ = await get_state(_chat_id)
-            _is_new_in_our_db = _state is None and not _history
-            if _is_new_in_our_db:
-                _already_in_crm = await has_existing_lead_in_crm(_client_phone)
-                if not _already_in_crm:
-                    asyncio.create_task(trigger_new_lead_callback(_chat_id, _client_phone))
-                    log.info(f"📞 {_chat_id} — звонок запущен (новый и у нас, и в CRM)")
-                else:
-                    log.info(f"🔕 {_chat_id} — новый в нашей базе, но уже есть в CRM, звонок не запускаем")
-            else:
-                log.info(f"🔕 {_chat_id} — уже писал боту раньше, звонок не запускаем")
-
-    is_whatsapp = payload.get("integration", {}).get("service") in ("whatsapp", "wapi")
-    if is_whatsapp and (BOT_PAUSED_WHATSAPP or whatsapp_auto_paused):
-        reason = "вручную" if BOT_PAUSED_WHATSAPP else "ночное расписание"
-        log.info(f"⏸️ WhatsApp бот на паузе ({reason}), игнорируем")
-        return web.Response(text="ok")
-    if not is_whatsapp and BOT_PAUSED_INSTAGRAM:
-        log.info("⏸️ Instagram бот на паузе, игнорируем")
-        return web.Response(text="ok")
-
-    log.info(f"📨 envy_hook payload: {json.dumps(payload, ensure_ascii=False)[:1000]}")
+    log.info(f"📨 envy_hook: {json.dumps(payload, ensure_ascii=False)[:1000]}")
 
     event_type = payload.get("event_type")
 
     if event_type == "message_reply":
-        message_data = payload.get("message_data") or {}
-        message_text = message_data.get("text") or ""
-        has_attachment = bool(message_data.get("attachments"))
+        message_text = (payload.get("message_data") or {}).get("text") or ""
         contact_check = payload.get("contact") or {}
         chat_id_check = str(contact_check.get("external_id") or "").strip()
         if chat_id_check.startswith("inst-"):
             chat_id_check = chat_id_check[5:]
-        if chat_id_check.startswith("wapp-"):
-            chat_id_check = chat_id_check[5:]  # normalize for sent_texts lookup
-        if message_text and chat_id_check in sent_texts and message_text in sent_texts[chat_id_check]:
-            log.info(f"🔄 Эхо Лолы text={message_text[:50]!r}, игнорируем")
+
+        # Lesson 10: вложение без подписи — не игнорируем, пишем что получили
+        if not message_text and chat_id_check:
+            attachments = (payload.get("message_data") or {}).get("attachments") or []
+            if attachments:
+                log.info(f"📎 {chat_id_check} прислал вложение без подписи (message_reply)")
+
+        if message_text and chat_id_check in sent_texts and message_text in sent_texts.get(chat_id_check, {}):
+            log.info(f"🔄 Эхо Луны text={message_text[:50]!r}, игнорируем")
             return web.Response(text="ok")
-        SMM_KEYWORDS = ["штат моделей", "съёмк", "съемк", "смм менеджер", "сотрудничеств", "исходник", "модел"]
+
         if any(kw in message_text.lower() for kw in SMM_KEYWORDS):
             if chat_id_check:
                 await set_state(chat_id_check, STATE_SMM)
-                log.info(f"📸 SMM-рассылка → {chat_id_check} STATE_SMM (навсегда)")
             return web.Response(text="ok")
+
         from_user = payload.get("from_user") or {}
         crm_employee_id = from_user.get("crm_employee_id")
         if crm_employee_id and crm_employee_id != 0 and crm_employee_id > 100000:
@@ -1206,27 +974,18 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
             if chat_id:
                 stored_last = last_bot_reply.get(chat_id, "")
                 if message_text and stored_last and message_text.strip() == stored_last.strip():
-                    log.info(
-                        f"🔄 Эхо с crm_employee_id={crm_employee_id} — игнорируем, это наш ответ"
-                    )
-                elif not message_text and not has_attachment:
-                    log.info(
-                        f"⏭️ message_reply без текста и без вложений от crm_employee_id={crm_employee_id} — игнорируем системное событие"
-                    )
+                    log.info(f"🔄 Эхо с crm_employee_id={crm_employee_id} — игнорируем")
                 else:
                     async with get_lock(chat_id):
                         await set_state(chat_id, STATE_MANAGER)
-                    reason = "текст" if message_text else "вложение (фото/файл)"
-                    log.info(f"👨‍💼 Менеджер (crm_employee_id={crm_employee_id}, {reason}) взял {chat_id} → STATE_MANAGER")
-        else:
-            log.info("⏭️ message_reply от системы, игнорируем")
+                    cancel_reminders(chat_id)
+                    log.info(f"👨‍💼 Менеджер взял {chat_id} → STATE_MANAGER")
         return web.Response(text="ok")
 
     if event_type != "message":
-        log.info(f"⏭️ event_type={event_type!r}, игнорируем")
         return web.Response(text="ok")
 
-    # Дедупликация по message_id
+    # Дедупликация
     message_id = payload.get("message_id")
     if message_id is not None:
         if message_id in processed_message_ids:
@@ -1239,119 +998,73 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
     if chat_id.startswith("inst-"):
         chat_id = chat_id[5:]
     if not chat_id:
-        log.warning("⚠️ Нет contact.external_id в payload, пропускаем")
         return web.Response(text="ok")
-    log.info(f"📌 chat_id={chat_id}")
-
-    # Номер клиента для Sipuni-звонка: сначала из пейлоада хука, иначе для
-    # WhatsApp сам chat_id и есть номер (после "wapp-"), иначе — из текста
-    # сообщения, если клиент прислал номер прямо в нём.
-    client_phone = contact.get("phone") or None
-    if not client_phone and chat_id.startswith("wapp-"):
-        client_phone = chat_id[5:]
 
     from_user = payload.get("from_user") or {}
     crm_employee_id = from_user.get("crm_employee_id")
-
     if crm_employee_id is not None and crm_employee_id != 0 and crm_employee_id > 100000:
         await set_state(chat_id, STATE_MANAGER)
-        log.info(f"👨‍💼 Менеджер (crm_employee_id={crm_employee_id}) взял {chat_id} → STATE_MANAGER")
+        cancel_reminders(chat_id)
         return web.Response(text="ok")
 
-    # Сообщение от клиента
     message_data = payload.get("message_data") or {}
     raw_text = message_data.get("text") or ""
     attachments = message_data.get("attachments") or []
+
     if raw_text.strip() == "You mentioned in the story":
-        log.info("⏭️ Отметка в сторис, игнорируем")
         return web.Response(text="ok")
-    if any(a.get("type") in ("story", "video") and not raw_text.strip() for a in attachments):
-        log.info("⏭️ Вложение сторис без текста, игнорируем")
+    if any(a.get("type") in ("story", "video") for a in attachments):
+        # Реклама Reels/сторис в Instagram при "Написать" шлёт отдельным сообщением
+        # весь текст объявления (с эмодзи/видео) — это не то, что печатает клиент.
+        # Реальный вопрос клиента всегда приходит отдельным сообщением следом.
+        log.info(f"📹 Пропускаем автоцитату рекламы (video/story) от chat_id={chat_id}")
         return web.Response(text="ok")
+
     if any(a.get("type") in ("audio", "voice") and not raw_text.strip() for a in attachments):
         audio_url = next(
             (a.get("link") or a.get("url") for a in attachments if a.get("type") in ("audio", "voice")),
             None,
         )
-        if audio_url:
-            log.info(f"🎤 Голосовое от {chat_id}, транскрибируем: {audio_url[:100]}")
-            text = await transcribe_audio(audio_url) or "[клиент отправил голосовое сообщение]"
-        else:
-            log.info(f"🎤 Голосовое от {chat_id}, нет ссылки на файл — используем заглушку")
-            text = "[клиент отправил голосовое сообщение]"
+        text = await transcribe_audio(audio_url) or "[клиент отправил голосовое сообщение]"
+    elif any(a.get("type") in ("image", "file") and not raw_text.strip() for a in attachments):
+        # Lesson 10: клиент прислал фото/файл без подписи (например, чек) — не молчим
+        text = "[клиент отправил вложение]"
+        # Луна не читает содержимое файлов (PDF/фото) — подстраховываемся и всегда
+        # шлём Артёму на проверку, вдруг это чек об оплате
+        attach_link = next(
+            (a.get("link") or a.get("url") for a in attachments if a.get("type") in ("image", "file")),
+            None,
+        )
+        asyncio.create_task(
+            send_payment_notification(
+                chat_id,
+                f"[файл без подписи, возможно чек]" + (f"\nСсылка: {attach_link}" if attach_link else ""),
+            )
+        )
     else:
-        if raw_text:
-            text: str | None = raw_text.strip()
-        elif any(a.get("type") == "doc" for a in attachments):
-            text = "[клиент отправил файл/документ — вероятно чек оплаты]"
-            log.info(f"📄 Документ без подписи от {chat_id}, передаю Claude с пометкой")
-        elif any(a.get("type") == "photo" for a in attachments):
-            text = "[клиент отправил фото]"
-            log.info(f"🖼️ Фото без подписи от {chat_id}, передаю Claude с пометкой")
-        else:
-            text = None
+        text = raw_text.strip() if raw_text else None
 
-    if not client_phone and text:
-        client_phone = extract_phone(text)
+    if any(kw in (text or "").lower() for kw in SMM_KEYWORDS):
+        await set_state(chat_id, STATE_SMM)
+        return web.Response(text="ok")
 
     try:
-        await handle_incoming(chat_id, text, client_phone)
+        pending_buffer.setdefault(chat_id, []).append(text or "")
+        old_task = pending_tasks.get(chat_id)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        pending_tasks[chat_id] = asyncio.create_task(_debounced_handle_incoming(chat_id))
     except Exception as e:
-        log.error(f"❌ handle_incoming error {chat_id}: {e}", exc_info=True)
+        log.error(f"❌ debounce schedule error {chat_id}: {e}", exc_info=True)
 
-    return web.Response(text="ok")
-
-
-async def webhook_handler(request: web.Request) -> web.Response:
-    try:
-        body = await request.read()
-        if not body:
-            return web.Response(text="ok")
-        try:
-            payload = json.loads(body)
-        except Exception:
-            log.warning(f"📡 /webhook non-JSON body: {body[:200]}")
-            return web.Response(text="ok")
-
-        log.info(f"📡 /webhook raw: {json.dumps(payload, ensure_ascii=False)[:500]}")
-
-        for entry in payload.get("entry") or []:
-            for event in entry.get("messaging") or []:
-                sender_id = (event.get("sender") or {}).get("id", "-")
-                recipient_id = (event.get("recipient") or {}).get("id", "-")
-                if "message" in event:
-                    event_type = "message"
-                    text = (event.get("message") or {}).get("text") or ""
-                elif "read" in event:
-                    event_type = "read"
-                    text = ""
-                elif "reaction" in event:
-                    event_type = "reaction"
-                    text = (event.get("reaction") or {}).get("emoji") or ""
-                else:
-                    event_type = list(event.keys() - {"sender", "recipient", "timestamp"})
-                    event_type = event_type[0] if event_type else "unknown"
-                    text = ""
-                log.info(
-                    f"📡 /webhook event: sender={sender_id} recipient={recipient_id} "
-                    f"type={event_type} text={text[:50] if text else '-'}"
-                )
-    except Exception as e:
-        log.error(f"❌ /webhook parse error: {e}", exc_info=True)
-
-    return web.Response(text="ok")
-
-
-async def wazzup_handler(request: web.Request) -> web.Response:
     return web.Response(text="ok")
 
 
 async def health_handler(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "bot_enabled": True})
+    return web.json_response({"status": "ok", "bot": "Luna", "school": "Champion School"})
 
 
-
-# ---------- DB ----------
+# ---------- DB init ----------
 async def init_db(app: web.Application) -> None:
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL)
@@ -1366,59 +1079,157 @@ async def init_db(app: web.Application) -> None:
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
+        await conn.execute("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()")
+        await conn.execute("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS history JSONB NOT NULL DEFAULT '[]'")
+        await conn.execute("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS deal_id BIGINT")
+        await conn.execute("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS awaiting_reply BOOLEAN NOT NULL DEFAULT FALSE")
+        # Лог сообщений клиентов — для ежедневного отчёта Артёму (кол-во клиентов, топ-темы)
         await conn.execute("""
-            ALTER TABLE dialogs
-            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+            CREATE TABLE IF NOT EXISTS message_log (
+                id         BIGSERIAL PRIMARY KEY,
+                chat_id    TEXT NOT NULL,
+                role       TEXT NOT NULL,
+                text       TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
         """)
-        await conn.execute("""
-            ALTER TABLE dialogs
-            ADD COLUMN IF NOT EXISTS history JSONB NOT NULL DEFAULT '[]'
-        """)
-        await conn.execute("""
-            ALTER TABLE dialogs
-            ADD COLUMN IF NOT EXISTS deal_id BIGINT
-        """)
-        await conn.execute("""
-            ALTER TABLE dialogs
-            ADD COLUMN IF NOT EXISTS awaiting_reply BOOLEAN NOT NULL DEFAULT FALSE
-        """)
-    try:
-        await init_rag(db_pool)
-    except Exception as e:
-        log.error(f"⚠️ RAG не инициализирован ({e}) — бот продолжит работу на статичной базе знаний")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_message_log_created_at ON message_log (created_at)")
     log.info("✅ DB готова")
 
 
 async def close_db(app: web.Application) -> None:
-    for task_name in ("resume_task", "whatsapp_schedule_task"):
-        task = app.get(task_name)
-        if task:
-            task.cancel()
     if db_pool:
         await db_pool.close()
 
 
+# ---------- HTTP-сессия (одна на всё приложение вместо новой на каждый запрос) ----------
+async def init_http_session(app: web.Application) -> None:
+    global http_session
+    http_session = aiohttp.ClientSession()
+    log.info("✅ HTTP-сессия инициализирована")
+
+
+async def close_http_session(app: web.Application) -> None:
+    if http_session:
+        await http_session.close()
+
+
+# ---------- Ежедневный отчёт Артёму ----------
+async def summarize_top_questions(texts: list[str]) -> str:
+    if not texts:
+        return "— нет данных —"
+    joined = "\n".join(f"- {t}" for t in texts)
+    try:
+        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        msg = await client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=400,
+            temperature=0.2,
+            system=(
+                "Ты анализируешь сообщения клиентов фитнес-школы за сутки. "
+                "Выдели 5 самых частых тем/вопросов коротким списком на русском, "
+                "без вступлений и заключений. Каждая тема с новой строки, начинай с «•»."
+            ),
+            messages=[{"role": "user", "content": joined[:20000]}],
+        )
+        return msg.content[0].text.strip()
+    except Exception as e:
+        log.error(f"❌ summarize_top_questions error: {e}")
+        return "— не удалось проанализировать —"
+
+
+async def build_and_send_daily_report() -> None:
+    try:
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT chat_id, text FROM message_log WHERE role='user' AND created_at >= $1",
+                since,
+            )
+        today = datetime.now(timezone.utc).strftime("%d.%m.%Y")
+        if not rows:
+            await send_whatsapp_to_manager(f"📊 Отчёт Луны за сутки ({today}): новых обращений не было.")
+            return
+
+        unique_clients = len({r["chat_id"] for r in rows})
+        total_messages = len(rows)
+        sample_texts = [r["text"] for r in rows if r["text"]][:200]
+        topics_summary = await summarize_top_questions(sample_texts)
+
+        report = (
+            f"📊 Отчёт Луны за сутки ({today})\n\n"
+            f"👥 Уникальных клиентов: {unique_clients}\n"
+            f"💬 Сообщений от клиентов: {total_messages}\n\n"
+            f"🔝 Частые темы:\n{topics_summary}"
+        )
+        await send_whatsapp_to_manager(report)
+        log.info("📊 Ежедневный отчёт отправлен Артёму")
+    except Exception as e:
+        log.error(f"❌ build_and_send_daily_report error: {e}")
+
+
+# ---------- Scheduler init ----------
+async def init_scheduler(app: web.Application) -> None:
+    global scheduler
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.start()
+    log.info("✅ APScheduler запущен")
+
+    # Первая синхронизация Google Sheets
+    loop = asyncio.get_event_loop()
+    ok = await loop.run_in_executor(None, sheets_sync.refresh_cache)
+    log.info(f"📊 Sheets sync при старте: {'✅' if ok else '⚠️ fallback на knowledge_base.py'}")
+
+    # 2 раза в день — 09:00 и 21:00 по Астане (UTC+5) = 04:00 и 16:00 UTC
+    async def _sync_sheets_job() -> None:
+        loop = asyncio.get_running_loop()
+        ok = await loop.run_in_executor(None, sheets_sync.refresh_cache)
+        log.info(f"📊 Sheets sync (по расписанию): {'✅' if ok else '⚠️ fallback на knowledge_base.py'}")
+
+    scheduler.add_job(
+        _sync_sheets_job,
+        CronTrigger(hour="4,16", minute=0),
+        id="sheets_sync",
+        replace_existing=True,
+    )
+
+    # Ежедневный отчёт Артёму — 20:00 по Астане (UTC+5) = 15:00 UTC
+    scheduler.add_job(
+        build_and_send_daily_report,
+        CronTrigger(hour=15, minute=0),
+        id="daily_report",
+        replace_existing=True,
+    )
+
+
+async def close_scheduler(app: web.Application) -> None:
+    if scheduler and scheduler.running:
+        scheduler.shutdown()
+
+
+# ---------- Background tasks ----------
 async def start_background_tasks(app: web.Application) -> None:
-    app["resume_task"] = asyncio.create_task(resume_unanswered_manager_chats())
-    app["sheets_sync_task"] = asyncio.create_task(sheets_sync.start_daily_sync())
-    app["whatsapp_schedule_task"] = asyncio.create_task(whatsapp_night_schedule_manager())
+    asyncio.create_task(resume_unanswered_manager_chats())
+    log.info("✅ Background task: resume_unanswered_manager_chats запущен")
 
 
 # ---------- App factory ----------
 def create_app() -> web.Application:
     app = web.Application()
-    app.router.add_post("/webhook",   webhook_handler)
-    app.router.add_get( "/webhook",   lambda r: web.Response(text="ok"))
     app.router.add_post("/envy_hook", envy_hook_handler)
-    app.router.add_post("/wazzup",    wazzup_handler)
-    app.router.add_get( "/health",    health_handler)
+    app.router.add_post("/wazzup",    lambda r: web.Response(text="ok"))
+    app.router.add_get("/health",     health_handler)
+    app.on_startup.append(init_http_session)
     app.on_startup.append(init_db)
+    app.on_startup.append(init_scheduler)
     app.on_startup.append(start_background_tasks)
     app.on_cleanup.append(close_db)
+    app.on_cleanup.append(close_scheduler)
+    app.on_cleanup.append(close_http_session)
     return app
 
 
 if __name__ == "__main__":
     app = create_app()
-    log.info("🚀 Champion Bot запущен")
+    log.info("🚀 Luna Bot (Champion School) запущена")
     web.run_app(app, host="0.0.0.0", port=PORT)
