@@ -28,6 +28,7 @@ from config import (
     DATABASE_URL,
     PORT,
     BOT_PAUSED_INSTAGRAM,
+    LUNA_SCHEDULE_ENABLED,
     ARTYOM_WHATSAPP_PERSONAL,
     WAZZUP_WHATSAPP_CHANNEL_ID,
 )
@@ -152,6 +153,19 @@ pending_buffer: dict[str, list[str]] = {}
 pending_tasks: dict[str, asyncio.Task] = {}
 
 MAX_HISTORY = 20
+
+# ---------- Автографик Луны: 20:00-11:00 Астана (работает ПОСЛЕ менеджеров) ----------
+# Днём (11:00-20:00) клиентов ведут живые менеджеры — бот молчит, чтобы не мешать.
+# Аналог ночной паузы у Лолы, только окно инвертировано (Луна активна ночью).
+ASTANA_TZ = timezone(timedelta(hours=5))
+LUNA_WORK_START_HOUR = 20  # начало смены Луны, Астана
+LUNA_WORK_END_HOUR = 11    # конец смены Луны, Астана
+
+
+def is_luna_working_hours() -> bool:
+    """True, если сейчас окно 20:00-11:00 по Астане (окно переходит через полночь)."""
+    hour = datetime.now(ASTANA_TZ).hour
+    return hour >= LUNA_WORK_START_HOUR or hour < LUNA_WORK_END_HOUR
 
 
 def should_notify(chat_id: str, cooldown_seconds: int = 300) -> bool:
@@ -672,6 +686,28 @@ async def handle_incoming(chat_id: str, text: str | None) -> None:
 
 
 async def _handle_incoming(chat_id: str, text: str | None) -> None:
+    # Автографик Луны: 20:00-11:00 Астана. В окно 11:00-20:00 работают живые
+    # менеджеры — бот молчит, но сообщение сохраняем в историю, чтобы контекст
+    # не терялся к моменту, когда Луна снова включится.
+    if LUNA_SCHEDULE_ENABLED and not is_luna_working_hours():
+        if text:
+            state, history, _, deal_id = await get_state(chat_id)
+            if state is None:
+                # Совсем новый лид, диалога в БД ещё нет. Не создаём строку с
+                # каким-то промежуточным state — иначе сломается ветка
+                # "state is None" (первое приветствие) при следующем сообщении.
+                # Сообщение всё равно видно менеджеру напрямую в EnvyCRM.
+                log.info(f"🌙 {chat_id}: новый лид вне графика Луны — не создаём диалог, ждём следующего сообщения")
+            else:
+                history = (history or []) + [{"role": "user", "content": text}]
+                history = history[-MAX_HISTORY:]
+                await set_state(chat_id, state, history=history, deal_id=deal_id)
+                asyncio.create_task(log_message(chat_id, "user", text))
+                log.info(f"🌙 {chat_id}: вне графика Луны (11:00-20:00 Астана — работают менеджеры), сообщение сохранено в историю, не отвечаем")
+                return
+        log.info(f"🌙 {chat_id}: вне графика Луны (11:00-20:00 Астана — работают менеджеры), не отвечаем")
+        return
+
     # Два отдельных кешируемых блока: промпт + база знаний
     kb = sheets_sync.get_cached_knowledge_base(fallback=KNOWLEDGE_BASE)
 
@@ -1150,7 +1186,6 @@ async def summarize_top_questions(texts: list[str]) -> str:
         return "— не удалось проанализировать —"
 
 
-ASTANA_TZ = timezone(timedelta(hours=5))
 LUNA_SHIFT_HOURS = 15  # рабочее окно Луны: 20:00-11:00 Астана = 15 часов
 
 
