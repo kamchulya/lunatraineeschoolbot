@@ -967,6 +967,13 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
         from_user = payload.get("from_user") or {}
         crm_employee_id = from_user.get("crm_employee_id")
         if crm_employee_id and crm_employee_id != 0 and crm_employee_id > 100000:
+            # Lesson (перенесено с Лолы): EnvyCRM иногда шлёт message_reply с пустым
+            # message_text, когда менеджер просто открыл карточку клиента, ничего не
+            # печатая. Это не реальный ответ — не переводим чат в STATE_MANAGER за это.
+            if not message_text.strip():
+                log.info(f"👀 message_reply с пустым текстом (крм_employee_id={crm_employee_id}) — вероятно открытие карточки, не реальный ответ, игнорируем")
+                return web.Response(text="ok")
+
             contact = payload.get("contact") or {}
             chat_id = str(contact.get("external_id") or "").strip()
             if chat_id.startswith("inst-"):
@@ -976,10 +983,15 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
                 if message_text and stored_last and message_text.strip() == stored_last.strip():
                     log.info(f"🔄 Эхо с crm_employee_id={crm_employee_id} — игнорируем")
                 else:
-                    async with get_lock(chat_id):
-                        await set_state(chat_id, STATE_MANAGER)
+                    # Lesson: НЕ используем общий per-chat lock здесь — если бот сейчас
+                    # генерирует ответ через Claude (держит get_lock несколько секунд),
+                    # запись STATE_MANAGER вставала бы в очередь за этим локом и не
+                    # успевала примениться до того, как бот уже отправит сообщение.
+                    # Прямая запись в БД без ожидания общего лока решает эту гонку.
+                    await set_state(chat_id, STATE_MANAGER)
+                    await clear_awaiting_reply(chat_id)
                     cancel_reminders(chat_id)
-                    log.info(f"👨‍💼 Менеджер взял {chat_id} → STATE_MANAGER")
+                    log.info(f"👨‍💼 Менеджер взял {chat_id} → STATE_MANAGER (реальный ответ, таймер ожидания сброшен)")
         return web.Response(text="ok")
 
     if event_type != "message":
@@ -1138,17 +1150,28 @@ async def summarize_top_questions(texts: list[str]) -> str:
         return "— не удалось проанализировать —"
 
 
+ASTANA_TZ = timezone(timedelta(hours=5))
+LUNA_SHIFT_HOURS = 15  # рабочее окно Луны: 20:00-11:00 Астана = 15 часов
+
+
 async def build_and_send_daily_report() -> None:
     try:
-        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        # Отчёт шлётся в конце смены (11:00 Астана) — окно строго 20:00-11:00,
+        # а не произвольные последние 24 часа (которые раньше захватывали и
+        # нерабочее для Луны время суток).
+        since = datetime.now(timezone.utc) - timedelta(hours=LUNA_SHIFT_HOURS)
         async with db_pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT chat_id, text FROM message_log WHERE role='user' AND created_at >= $1",
                 since,
             )
-        today = datetime.now(timezone.utc).strftime("%d.%m.%Y")
+        # Дата смены — день, когда началось окно 20:00 (т.е. "вчера" относительно
+        # момента отправки отчёта в 11:00 Астана).
+        shift_date = (datetime.now(ASTANA_TZ) - timedelta(days=1)).strftime("%d.%m")
+        period_label = f"{shift_date} (20:00-11:00)"
+
         if not rows:
-            await send_whatsapp_to_manager(f"📊 Отчёт Луны за сутки ({today}): новых обращений не было.")
+            await send_whatsapp_to_manager(f"📊 Отчёт Луны за {period_label}: новых обращений не было.")
             return
 
         unique_clients = len({r["chat_id"] for r in rows})
@@ -1157,13 +1180,13 @@ async def build_and_send_daily_report() -> None:
         topics_summary = await summarize_top_questions(sample_texts)
 
         report = (
-            f"📊 Отчёт Луны за сутки ({today})\n\n"
+            f"📊 Отчёт Луны за {period_label}\n\n"
             f"👥 Уникальных клиентов: {unique_clients}\n"
             f"💬 Сообщений от клиентов: {total_messages}\n\n"
             f"🔝 Частые темы:\n{topics_summary}"
         )
         await send_whatsapp_to_manager(report)
-        log.info("📊 Ежедневный отчёт отправлен Артёму")
+        log.info("📊 Отчёт за смену отправлен Артёму")
     except Exception as e:
         log.error(f"❌ build_and_send_daily_report error: {e}")
 
@@ -1193,10 +1216,12 @@ async def init_scheduler(app: web.Application) -> None:
         replace_existing=True,
     )
 
-    # Ежедневный отчёт Артёму — 20:00 по Астане (UTC+5) = 15:00 UTC
+    # Отчёт Артёму по итогам смены Луны (20:00-11:00 Астана) — шлётся в КОНЦЕ
+    # смены, 11:00 по Астане (UTC+5) = 06:00 UTC. Раньше шёл в 20:00 (начало
+    # смены) с окном "последние 24 часа" — оба момента были некорректны.
     scheduler.add_job(
         build_and_send_daily_report,
-        CronTrigger(hour=15, minute=0),
+        CronTrigger(hour=6, minute=0),
         id="daily_report",
         replace_existing=True,
     )
