@@ -615,7 +615,12 @@ def detect_lang(text: str) -> str:
 
 
 def detect_demo_sent(reply: str) -> bool:
-    demo_markers = ["skillspace.ru", "championschool.kz", "демо", "demo", "регистрац", "перейти по ссылке"]
+    # ВАЖНО: ловим только реально отправленную ссылку на платформу (домен из базы
+    # знаний), а не просто упоминание слова "демо" — иначе фраза-предложение вида
+    # "Могу отправить бесплатный демо-доступ..." (шаг 8 промпта, до согласия клиента
+    # и до самой ссылки) уже засчитывалась бы как "демо отправлено" и включала
+    # напоминания, хотя ссылка ещё не отправлена.
+    demo_markers = ["skillspace.ru"]
     return any(marker in reply.lower() for marker in demo_markers)
 
 
@@ -727,9 +732,16 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
             elapsed = (now - updated_at).total_seconds()
             if state == STATE_MANAGER and elapsed >= 1800:  # 30 мин
                 log.info(f"🔄 {chat_id} state=manager устарел (>30мин), сбрасываем")
+                # ВАЖНО: сразу пишем сброс в БД (обычным set_state, без guard).
+                # Раньше state сбрасывался только в локальной переменной — реальная
+                # запись в БД оставалась 'manager', и последующий set_state_guarded()
+                # в конце функции (у которого условие WHERE state NOT IN ('manager',...))
+                # молча не срабатывал. В итоге диалог навсегда застревал в 'manager'.
+                await set_state(chat_id, STATE_ACTIVE, history=history, deal_id=deal_id)
                 state = None
             elif state in {STATE_DONE, STATE_REFUSED} and elapsed >= 3600:
                 log.info(f"🔄 {chat_id} state={state} устарел, сбрасываем")
+                await set_state(chat_id, STATE_ACTIVE, history=history, deal_id=deal_id)
                 state = None
             else:
                 if state == STATE_MANAGER and text:
