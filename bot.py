@@ -28,6 +28,7 @@ from config import (
     DATABASE_URL,
     PORT,
     BOT_PAUSED_INSTAGRAM,
+    LUNA_SCHEDULE_ENABLED,
     ARTYOM_WHATSAPP_PERSONAL,
     WAZZUP_WHATSAPP_CHANNEL_ID,
 )
@@ -95,18 +96,54 @@ def detect_payment_claim(text: str) -> bool:
     t = text.lower()
     return any(kw in t for kw in PAYMENT_CLAIM_KEYWORDS)
 
-# ---------- Напоминания после демо ----------
-REMINDER_DELAYS = [
-    (3600,  "reminder_1h"),
-    (10800, "reminder_3h"),
-    (36000, "reminder_10h"),
+# ---------- Цепочка напоминаний при молчании клиента ----------
+# Запускается после ЛЮБОГО нашего исходящего сообщения (бота или менеджера) —
+# не привязана к демо-доступу. Каждая дельта отсчитывается от предыдущего
+# события в цепочке (отправленное напоминание либо "мягкий" ответ клиента на
+# него) — НЕ накопительно от изначального момента молчания.
+REMINDER_CHAIN: list[tuple[int, str]] = [
+    (3600, (
+        "Иногда одно решение меняет гораздо больше, чем кажется… ✨\n"
+        "Мы недавно обсуждали обучение🙂\n"
+        "Если вдруг \"закрутился день\" или сейчас неудобно ответить — это абсолютно нормально.\n"
+        "Напишите, пожалуйста, когда Вам будет удобно, мы вам позвоним или напишем 🌿"
+    )),
+    (10800, (
+        "Вчера заметили одну интересную закономерность🤔\n"
+        "Большинство людей откладывают обучение не потому, что оно им не нужно.\n"
+        "А потому что кажется, что \"ещё не время\".\n"
+        "Если захотите посмотреть, как проходит обучение у нас — вот видео школы.\n"
+        "https://www.instagram.com/reel/DWrG4oXiKvR/?igsh=NHVxOHI0ZWQ2amE="
+    )),
+    (18000, (
+        "Иногда достаточно двух минут, чтобы многое стало понятнее… 🎥\n"
+        "Отправляю короткое видео о нашей школе👇\n"
+        "https://www.instagram.com/reel/DI3_-a3I4zA/?igsh=MmNzanl1Z2hmc2lr"
+    )),
+    (36000, (
+        "Многие наши ученики перед обучением говорили одну и ту же фразу… 🤔\n"
+        "«Я думал(а), что без опыта вообще ничего не получится.»\n"
+        "Оказалось, всё намного проще, чем казалось в начале 💪\n"
+        "Посмотрите, как это получилось у наших выпускников 👇\n"
+        "https://www.instagram.com/reel/DW6WaodCI32/?igsh=bDkxODlvMGtmbXl1"
+    )),
+    (75600, (
+        "Можно задам один короткий вопрос? 🙂\n"
+        "Что для Вас сейчас самое важное при выборе школы?\n"
+        "1️⃣ Наполняемость курса.\n"
+        "2️⃣ Поддержка лектора.\n"
+        "3️⃣ Цена.\n"
+        "4️⃣ Чтобы обучение было удобным по графику.\n"
+        "5️⃣ Пока просто изучаю разные варианты.\n"
+        "Можно просто написать цифру — так мне будет проще понять, что для Вас "
+        "действительно важно 🌿"
+    )),
 ]
 
-REMINDER_TEXTS = {
-    "reminder_1h":  "Как впечатления от платформы? Если есть вопросы — я на связи 😊",
-    "reminder_3h":  "Луна напоминает: вы можете начать обучение уже сейчас 🎓 Хотите, помогу подобрать оптимальный вариант?",
-    "reminder_10h": "Подскажите, удалось посмотреть материалы? Могу проконсультировать по обучению или по оплате 😊",
-}
+# Состояния, в которых цепочка напоминаний никогда не запускается/не срабатывает.
+# STATE_MANAGER сюда специально НЕ входит — по ТЗ цепочка обязана сработать,
+# даже если клиент молчит именно после сообщения менеджера, а не бота.
+REMINDER_CHAIN_BLOCKED_STATES = {STATE_DONE, STATE_REFUSED, STATE_SMM}
 
 CLAUDE_FALLBACK = {
     "ru": "Извините, небольшой сбой. Напишите позже или менеджер свяжется с Вами 😊",
@@ -133,6 +170,63 @@ SMM_KEYWORDS = [
     "сотрудничеств", "исходник", "модел",
 ]
 
+# ---------- Таргет-реклама: комментарий "хочу" → авто-DM ----------
+# Маркетинг запускает таргет с призывом написать "хочу" в комментариях к посту.
+# Instagram/Wazzup при этом создаёт автоматическое сообщение в Direct с текстом
+# комментария. Требование: отвечать ТОЛЬКО если в исходном комментарии есть слово
+# "хочу" — остальные комментарии игнорировать молча, не заводя воронку.
+AD_COMMENT_TRIGGER_WORD = "хочу"
+
+AD_COMMENT_OPENERS = [
+    "Привет! 👋\n"
+    "Спасибо за комментарий ❤️\n"
+    "Скажите, пожалуйста, Вы сейчас живёте в Казахстане или в другой стране? 😊\n"
+    "🎓 Учиться можно из любой точки мира.\n"
+    "📱 Все уроки доступны онлайн в удобное время.\n"
+    "📜 После успешного окончания Вы получите сертификат.\n"
+    "Подскажите, Вас интересует фитнес-тренер или тренер групповых программ?",
+
+    "Привет! 👋\n"
+    "Очень приятно, что Вас заинтересовало обучение.\n"
+    "Скажите, пожалуйста, Вы сейчас живёте в Казахстане или в другой стране? 😊\n"
+    "Самое классное в онлайн-формате — можно проходить обучение тогда, когда удобно "
+    "именно Вам, независимо от города или страны 🌍\n"
+    "Подскажите, Вас интересует фитнес-тренер или тренер групповых программ?",
+
+    "Привет! 👋\n"
+    "Спасибо за интерес к нашей школе ❤️\n"
+    "Скажите, пожалуйста, Вы сейчас живёте в Казахстане или в другой стране? 😊\n"
+    "Уже более 2500 человек прошли обучение у нас, и многие сейчас успешно работают "
+    "фитнес-тренерами 💪\n"
+    "Подскажите, Вас интересует фитнес-тренер или тренер групповых программ?",
+]
+
+
+def detect_ad_comment_text(payload: dict) -> str | None:
+    """Пытается вытащить текст исходного комментария из вебхука Wazzup, если
+    входящее сообщение — это автоматический DM, созданный Instagram/Wazzup
+    в ответ на комментарий к посту (а не сообщение, написанное клиентом
+    напрямую в директ).
+
+    ⚠️ TODO / НЕ ПОДТВЕРЖДЕНО: точные названия полей в реальном вебхуке Wazzup
+    для этого сценария пока неизвестны — нет примера payload. Список ключей
+    ниже — консервативная попытка (referral/context/quoted/comment/post —
+    частые названия у похожих интеграций), но пока не проверена на реальных
+    данных. Функция специально возвращает None при любой неопределённости,
+    чтобы НЕ ломать обработку обычных сообщений в директ, пока не пришлют
+    реальный лог такого события для сверки.
+    """
+    for key in ("referral", "context", "quotedMessage", "comment", "post"):
+        val = payload.get(key)
+        if isinstance(val, dict):
+            text = val.get("text") or val.get("comment_text")
+            if text:
+                return text
+    message_data = payload.get("message_data") or {}
+    if message_data.get("type") in ("comment", "comment_reply"):
+        return message_data.get("text")
+    return None
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
@@ -152,6 +246,19 @@ pending_buffer: dict[str, list[str]] = {}
 pending_tasks: dict[str, asyncio.Task] = {}
 
 MAX_HISTORY = 20
+
+# ---------- Автографик Луны: 20:00-11:00 Астана (работает ПОСЛЕ менеджеров) ----------
+# Днём (11:00-20:00) клиентов ведут живые менеджеры — бот молчит, чтобы не мешать.
+# Аналог ночной паузы у Лолы, только окно инвертировано (Луна активна ночью).
+ASTANA_TZ = timezone(timedelta(hours=5))
+LUNA_WORK_START_HOUR = 20  # начало смены Луны, Астана
+LUNA_WORK_END_HOUR = 11    # конец смены Луны, Астана
+
+
+def is_luna_working_hours() -> bool:
+    """True, если сейчас окно 20:00-11:00 по Астане (окно переходит через полночь)."""
+    hour = datetime.now(ASTANA_TZ).hour
+    return hour >= LUNA_WORK_START_HOUR or hour < LUNA_WORK_END_HOUR
 
 
 def should_notify(chat_id: str, cooldown_seconds: int = 300) -> bool:
@@ -197,6 +304,17 @@ async def get_state(chat_id: str) -> tuple[str | None, list, datetime | None, in
         history = json.loads(row["history"]) if row["history"] else []
         return row["state"], history, row["updated_at"], row["deal_id"]
     return None, [], None, None
+
+
+async def get_reminder_step(chat_id: str) -> int | None:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT reminder_step FROM dialogs WHERE chat_id=$1", chat_id)
+    return row["reminder_step"] if row else None
+
+
+async def save_reminder_step(chat_id: str, step: int | None) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE dialogs SET reminder_step=$1 WHERE chat_id=$2", step, chat_id)
 
 
 async def set_state(
@@ -304,52 +422,106 @@ async def send_wazzup(chat_id: str, text: str) -> None:
     log.error(f"❌ Wazzup: все 3 попытки провалились для {chat_id}")
 
 
-# ---------- APScheduler: напоминания после демо ----------
-async def send_reminder(chat_id: str, reminder_key: str) -> None:
+# ---------- APScheduler: цепочка напоминаний при молчании клиента ----------
+def schedule_reminder_chain(chat_id: str, step: int, anchor: datetime | None = None) -> None:
+    """Планирует шаг step цепочки (0-based) через REMINDER_CHAIN[step] секунд
+    от anchor (или от текущего момента, если anchor не передан). У каждого
+    чата в любой момент времени — максимум одна запланированная задача
+    цепочки (id детерминирован по chat_id, replace_existing=True)."""
+    if scheduler is None or step >= len(REMINDER_CHAIN):
+        return
+    base = anchor or datetime.now(timezone.utc)
+    delay_sec, _ = REMINDER_CHAIN[step]
+    run_time = base + timedelta(seconds=delay_sec)
+    job_id = f"{chat_id}_reminder_chain"
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+    scheduler.add_job(
+        send_reminder_chain_step,
+        "date",
+        run_date=run_time,
+        args=[chat_id, step],
+        id=job_id,
+        replace_existing=True,
+    )
+
+
+def cancel_reminder_chain(chat_id: str) -> None:
+    if scheduler is None:
+        return
+    job_id = f"{chat_id}_reminder_chain"
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+        log.info(f"🗑️ Отменена запланированная цепочка напоминаний для {chat_id}")
+
+
+async def start_reminder_chain(chat_id: str, anchor: datetime | None = None) -> None:
+    """Вызывается после ЛЮБОГО нашего исходящего сообщения (бот или менеджер) —
+    перезапускает цепочку с шага 0 (первое напоминание — через 1 час)."""
+    schedule_reminder_chain(chat_id, 0, anchor=anchor)
+    await save_reminder_step(chat_id, 0)
+
+
+async def send_reminder_chain_step(chat_id: str, step: int) -> None:
     try:
-        state, _, _, _ = await get_state(chat_id)
-        if state != STATE_DEMO_SENT:
-            log.info(f"⏭️ Напоминание {reminder_key} для {chat_id} отменено (state={state})")
+        state, history, _, deal_id = await get_state(chat_id)
+        if state in REMINDER_CHAIN_BLOCKED_STATES:
+            log.info(f"⏭️ Цепочка напоминаний {chat_id} шаг {step} отменена (state={state})")
+            await save_reminder_step(chat_id, None)
             return
-        text = REMINDER_TEXTS.get(reminder_key, "")
-        if not text:
+        if step >= len(REMINDER_CHAIN):
             return
-        log.info(f"🔔 Отправляю напоминание {reminder_key} → {chat_id}")
+        _, text = REMINDER_CHAIN[step]
+        log.info(f"🔔 Цепочка напоминаний: отправляю шаг {step} → {chat_id}")
         await send_wazzup(chat_id, text)
-        state2, history, _, deal_id = await get_state(chat_id)
         history.append({"role": "assistant", "content": text})
-        await set_state(chat_id, STATE_DEMO_SENT, history=history, deal_id=deal_id)
+        await set_state(chat_id, STATE_ACTIVE, history=history, deal_id=deal_id)
+        asyncio.create_task(log_message(chat_id, "assistant", text))
+        next_step = step + 1
+        if next_step < len(REMINDER_CHAIN):
+            await save_reminder_step(chat_id, next_step)
+            schedule_reminder_chain(chat_id, next_step)
+        else:
+            log.info(f"🏁 Цепочка напоминаний для {chat_id} завершена (все 5 шагов отправлены)")
+            await save_reminder_step(chat_id, None)
     except Exception as e:
-        log.error(f"❌ send_reminder {reminder_key} {chat_id}: {e}")
+        log.error(f"❌ send_reminder_chain_step {step} {chat_id}: {e}")
 
 
-def schedule_reminders(chat_id: str) -> None:
-    if scheduler is None:
-        return
-    now = datetime.now(timezone.utc)
-    for delay_sec, reminder_key in REMINDER_DELAYS:
-        run_time = now + timedelta(seconds=delay_sec)
-        job_id = f"{chat_id}_{reminder_key}"
-        if scheduler.get_job(job_id):
-            scheduler.remove_job(job_id)
-        scheduler.add_job(
-            send_reminder,
-            "date",
-            run_date=run_time,
-            args=[chat_id, reminder_key],
-            id=job_id,
-            replace_existing=True,
+async def classify_reminder_response(text: str) -> str:
+    """Классифицирует ответ клиента на уже отправленное напоминание.
+    Вызывается ТОЛЬКО когда клиент отвечает после того, как ему уже ушёл
+    хотя бы один шаг цепочки (reminder_step >= 1) — то есть он реагирует
+    именно на напоминание, а не продолжает обычный диалог.
+
+    'soft'     — расплывчатый/отложенный ответ без конкретики
+                 ("я подумаю", "ок", "хорошо", эмодзи, "занята сейчас" и т.п.)
+    'critical' — реальный вопрос, возражение, готовность обсуждать детали —
+                 требует содержательного ответа по существу.
+    При ошибке классификации безопасный дефолт — 'critical' (лучше ответить
+    по существу, чем молча продолжить автоматическую рассылку)."""
+    try:
+        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        msg = await client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=10,
+            temperature=0,
+            system=(
+                "Клиент отвечает на автоматическое напоминание от школы фитнеса. "
+                "Определи тип ответа. 'soft' — расплывчатый/отложенный ответ без "
+                "конкретики (например 'я подумаю', 'ок', 'хорошо', 'сейчас занята', "
+                "просто эмодзи, любое подтверждение без вопроса по существу). "
+                "'critical' — содержит реальный вопрос, возражение, готовность "
+                "обсуждать детали — что угодно, требующее содержательного ответа "
+                "по курсу. Ответь ОДНИМ словом: soft или critical. Больше ничего не пиши."
+            ),
+            messages=[{"role": "user", "content": text}],
         )
-
-
-def cancel_reminders(chat_id: str) -> None:
-    if scheduler is None:
-        return
-    for _, reminder_key in REMINDER_DELAYS:
-        job_id = f"{chat_id}_{reminder_key}"
-        if scheduler.get_job(job_id):
-            scheduler.remove_job(job_id)
-            log.info(f"🗑️ Отменено напоминание {reminder_key} для {chat_id}")
+        result = msg.content[0].text.strip().lower()
+        return "soft" if "soft" in result else "critical"
+    except Exception as e:
+        log.error(f"❌ classify_reminder_response error: {e}")
+        return "critical"
 
 
 # ---------- EnvyCRM ----------
@@ -601,7 +773,12 @@ def detect_lang(text: str) -> str:
 
 
 def detect_demo_sent(reply: str) -> bool:
-    demo_markers = ["skillspace.ru", "championschool.kz", "демо", "demo", "регистрац", "перейти по ссылке"]
+    # ВАЖНО: ловим только реально отправленную ссылку на платформу (домен из базы
+    # знаний), а не просто упоминание слова "демо" — иначе фраза-предложение вида
+    # "Могу отправить бесплатный демо-доступ..." (шаг 8 промпта, до согласия клиента
+    # и до самой ссылки) уже засчитывалась бы как "демо отправлено" и включала
+    # напоминания, хотя ссылка ещё не отправлена.
+    demo_markers = ["skillspace.ru"]
     return any(marker in reply.lower() for marker in demo_markers)
 
 
@@ -672,10 +849,39 @@ async def handle_incoming(chat_id: str, text: str | None) -> None:
 
 
 async def _handle_incoming(chat_id: str, text: str | None) -> None:
+    # Автографик Луны: 20:00-11:00 Астана. В окно 11:00-20:00 работают живые
+    # менеджеры — бот молчит, но сообщение сохраняем в историю, чтобы контекст
+    # не терялся к моменту, когда Луна снова включится.
+    if LUNA_SCHEDULE_ENABLED and not is_luna_working_hours():
+        if text:
+            state, history, _, deal_id = await get_state(chat_id)
+            if state is None:
+                # Совсем новый лид, диалога в БД ещё нет. Не создаём строку с
+                # каким-то промежуточным state — иначе сломается ветка
+                # "state is None" (первое приветствие) при следующем сообщении.
+                # Сообщение всё равно видно менеджеру напрямую в EnvyCRM.
+                log.info(f"🌙 {chat_id}: новый лид вне графика Луны — не создаём диалог, ждём следующего сообщения")
+            else:
+                history = (history or []) + [{"role": "user", "content": text}]
+                history = history[-MAX_HISTORY:]
+                await set_state(chat_id, state, history=history, deal_id=deal_id)
+                asyncio.create_task(log_message(chat_id, "user", text))
+                log.info(f"🌙 {chat_id}: вне графика Луны (11:00-20:00 Астана — работают менеджеры), сообщение сохранено в историю, не отвечаем")
+                return
+        log.info(f"🌙 {chat_id}: вне графика Луны (11:00-20:00 Астана — работают менеджеры), не отвечаем")
+        return
+
     # Два отдельных кешируемых блока: промпт + база знаний
     kb = sheets_sync.get_cached_knowledge_base(fallback=KNOWLEDGE_BASE)
 
     state, history, updated_at, deal_id = await get_state(chat_id)
+    reminder_step_before = await get_reminder_step(chat_id) if text else None
+
+    if text:
+        # Клиент написал — в любом случае гасим запланированный шаг цепочки
+        # напоминаний, независимо от текущего state (даже если чат сейчас
+        # закреплён за менеджером — клиент всё равно уже не молчит).
+        cancel_reminder_chain(chat_id)
 
     if state == STATE_NEW and history and history[0].get("content") == text:
         log.info(f"♻️ Дубль сообщения в STATE_NEW {chat_id}, пропускаем")
@@ -691,9 +897,16 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
             elapsed = (now - updated_at).total_seconds()
             if state == STATE_MANAGER and elapsed >= 1800:  # 30 мин
                 log.info(f"🔄 {chat_id} state=manager устарел (>30мин), сбрасываем")
+                # ВАЖНО: сразу пишем сброс в БД (обычным set_state, без guard).
+                # Раньше state сбрасывался только в локальной переменной — реальная
+                # запись в БД оставалась 'manager', и последующий set_state_guarded()
+                # в конце функции (у которого условие WHERE state NOT IN ('manager',...))
+                # молча не срабатывал. В итоге диалог навсегда застревал в 'manager'.
+                await set_state(chat_id, STATE_ACTIVE, history=history, deal_id=deal_id)
                 state = None
             elif state in {STATE_DONE, STATE_REFUSED} and elapsed >= 3600:
                 log.info(f"🔄 {chat_id} state={state} устарел, сбрасываем")
+                await set_state(chat_id, STATE_ACTIVE, history=history, deal_id=deal_id)
                 state = None
             else:
                 if state == STATE_MANAGER and text:
@@ -706,10 +919,6 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
         else:
             log.info(f"🔇 {chat_id} state={state}, молчим")
             return
-
-    # Клиент написал сам после демо → отменяем напоминания
-    if state == STATE_DEMO_SENT and text:
-        cancel_reminders(chat_id)
 
     if text:
         asyncio.create_task(log_message(chat_id, "user", text))
@@ -753,10 +962,10 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
         new_state = STATE_NEW if is_truly_new else STATE_ACTIVE
         if detect_demo_sent(reply):
             new_state = STATE_DEMO_SENT
-            await set_state_guarded(chat_id, new_state, history=history)
-            schedule_reminders(chat_id)
-        else:
-            await set_state_guarded(chat_id, new_state, history=history)
+        await set_state_guarded(chat_id, new_state, history=history)
+        # Цепочка напоминаний запускается после ЛЮБОГО нашего сообщения, в том
+        # числе после самого первого приветствия — если лид вообще не ответил.
+        await start_reminder_chain(chat_id)
 
         if should_notify(chat_id):
             asyncio.create_task(notify_manager(chat_id, chat_id, known_deal_id=deal_id))
@@ -803,8 +1012,59 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
         await send_wazzup(chat_id, farewell)
         asyncio.create_task(log_message(chat_id, "assistant", farewell))
         await set_state(chat_id, STATE_REFUSED, history=history)
-        cancel_reminders(chat_id)
+        cancel_reminder_chain(chat_id)
+        await save_reminder_step(chat_id, None)
         return
+
+    # Клиент отвечает именно на уже отправленное напоминание (reminder_step_before
+    # >= 1 означает, что хотя бы один шаг цепочки реально ушёл клиенту) — нужно
+    # понять, "мягкий" это ответ (тогда просто коротко реагируем и переносим
+    # СЛЕДУЮЩИЙ шаг цепочки на его собственную дельту от этого момента, не сбрасывая
+    # всю цепочку) или "критичный" (тогда отвечаем по существу как обычно, и уже
+    # обычная логика ниже перезапустит цепочку с нуля после отправки ответа).
+    if reminder_step_before is not None and reminder_step_before >= 1:
+        response_type = await classify_reminder_response(text)
+        if response_type == "soft":
+            history.append({"role": "user", "content": text})
+            history = history[-MAX_HISTORY:]
+            try:
+                soft_reply = await claude_reply(
+                    history,
+                    SYSTEM_PROMPT + (
+                        "\n\nВАЖНО: клиент только что ответил расплывчато/отложенно на "
+                        "автоматическое напоминание (например \"я подумаю\", \"ок\", "
+                        "\"хорошо\"). Отреагируй коротко и тепло (1-2 предложения), без "
+                        "давления и не повторяя вопросы воронки — просто дай понять, что "
+                        "ты на связи и не торопишь."
+                    ),
+                    kb=kb,
+                )
+                if not soft_reply or not soft_reply.strip():
+                    raise ValueError("пустой ответ")
+            except Exception as e:
+                log.error(f"❌ Claude error on soft reminder reply: {e}")
+                soft_reply = CLAUDE_FALLBACK.get(detect_lang(text), CLAUDE_FALLBACK["ru"])
+            history.append({"role": "assistant", "content": soft_reply})
+            history = history[-MAX_HISTORY:]
+
+            current_state, _, _, _ = await get_state(chat_id)
+            if current_state in SILENT_STATES:
+                log.info(f"🚫 {chat_id} — менеджер взял чат пока Claude думал, отмена отправки")
+                return
+
+            log.info(f"💬 Мягкий ответ на напоминание → {chat_id}: {soft_reply[:200]}")
+            await send_wazzup(chat_id, soft_reply)
+            asyncio.create_task(log_message(chat_id, "assistant", soft_reply))
+            await set_state_guarded(chat_id, STATE_ACTIVE, history=history)
+            # Не сбрасываем цепочку на шаг 0 — переносим ИМЕННО следующий
+            # запланированный шаг на его собственную дельту от текущего момента.
+            anchor_now = datetime.now(timezone.utc)
+            schedule_reminder_chain(chat_id, reminder_step_before, anchor=anchor_now)
+            await save_reminder_step(chat_id, reminder_step_before)
+            if should_notify(chat_id):
+                asyncio.create_task(notify_manager(chat_id, chat_id, known_deal_id=deal_id))
+            return
+        # response_type == "critical" — просто продолжаем обычной веткой ниже
 
     history.append({"role": "user", "content": text})
     history = history[-MAX_HISTORY:]
@@ -837,9 +1097,11 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
 
     if detect_demo_sent(reply):
         await set_state_guarded(chat_id, STATE_DEMO_SENT, history=history)
-        schedule_reminders(chat_id)
     else:
         await set_state_guarded(chat_id, STATE_ACTIVE, history=history)
+    # Любое исходящее сообщение (в т.ч. этот обычный/критичный ответ) заново
+    # запускает цепочку напоминаний с шага 0 (первое напоминание — через 1 час).
+    await start_reminder_chain(chat_id)
 
     if should_notify(chat_id):
         asyncio.create_task(notify_manager(chat_id, chat_id, known_deal_id=deal_id))
@@ -883,6 +1145,7 @@ async def _answer_pending(chat_id: str) -> None:
         del last_bot_reply[next(iter(last_bot_reply))]
     last_bot_reply[chat_id] = reply
     await set_state(chat_id, STATE_ACTIVE, history=history)
+    await start_reminder_chain(chat_id)
 
 
 async def resume_unanswered_manager_chats() -> None:
@@ -967,6 +1230,13 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
         from_user = payload.get("from_user") or {}
         crm_employee_id = from_user.get("crm_employee_id")
         if crm_employee_id and crm_employee_id != 0 and crm_employee_id > 100000:
+            # Lesson (перенесено с Лолы): EnvyCRM иногда шлёт message_reply с пустым
+            # message_text, когда менеджер просто открыл карточку клиента, ничего не
+            # печатая. Это не реальный ответ — не переводим чат в STATE_MANAGER за это.
+            if not message_text.strip():
+                log.info(f"👀 message_reply с пустым текстом (крм_employee_id={crm_employee_id}) — вероятно открытие карточки, не реальный ответ, игнорируем")
+                return web.Response(text="ok")
+
             contact = payload.get("contact") or {}
             chat_id = str(contact.get("external_id") or "").strip()
             if chat_id.startswith("inst-"):
@@ -976,10 +1246,15 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
                 if message_text and stored_last and message_text.strip() == stored_last.strip():
                     log.info(f"🔄 Эхо с crm_employee_id={crm_employee_id} — игнорируем")
                 else:
-                    async with get_lock(chat_id):
-                        await set_state(chat_id, STATE_MANAGER)
-                    cancel_reminders(chat_id)
-                    log.info(f"👨‍💼 Менеджер взял {chat_id} → STATE_MANAGER")
+                    # Lesson: НЕ используем общий per-chat lock здесь — если бот сейчас
+                    # генерирует ответ через Claude (держит get_lock несколько секунд),
+                    # запись STATE_MANAGER вставала бы в очередь за этим локом и не
+                    # успевала примениться до того, как бот уже отправит сообщение.
+                    # Прямая запись в БД без ожидания общего лока решает эту гонку.
+                    await set_state(chat_id, STATE_MANAGER)
+                    await clear_awaiting_reply(chat_id)
+                    await start_reminder_chain(chat_id)
+                    log.info(f"👨‍💼 Менеджер взял {chat_id} → STATE_MANAGER (реальный ответ, цепочка напоминаний перезапущена от сообщения менеджера)")
         return web.Response(text="ok")
 
     if event_type != "message":
@@ -1004,7 +1279,7 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
     crm_employee_id = from_user.get("crm_employee_id")
     if crm_employee_id is not None and crm_employee_id != 0 and crm_employee_id > 100000:
         await set_state(chat_id, STATE_MANAGER)
-        cancel_reminders(chat_id)
+        await start_reminder_chain(chat_id)
         return web.Response(text="ok")
 
     message_data = payload.get("message_data") or {}
@@ -1048,6 +1323,34 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
         await set_state(chat_id, STATE_SMM)
         return web.Response(text="ok")
 
+    # ---------- Таргет-реклама: комментарий "хочу" → авто-DM ----------
+    # Применяем только к новым диалогам (ещё нет state в БД) — чтобы случайно
+    # не перехватить обработку у уже идущего разговора.
+    ad_comment_text = detect_ad_comment_text(payload)
+    if ad_comment_text is not None:
+        existing_state, _, _, _ = await get_state(chat_id)
+        if existing_state is None:
+            if AD_COMMENT_TRIGGER_WORD not in ad_comment_text.lower():
+                log.info(
+                    f"🔕 {chat_id}: комментарий без слова "
+                    f"'{AD_COMMENT_TRIGGER_WORD}' ({ad_comment_text[:80]!r}), игнорируем"
+                )
+                return web.Response(text="ok")
+            opener = random.choice(AD_COMMENT_OPENERS)
+            await send_wazzup(chat_id, opener)
+            history = [
+                {"role": "user", "content": ad_comment_text},
+                {"role": "assistant", "content": opener},
+            ]
+            await set_state(chat_id, STATE_ACTIVE, history=history)
+            await start_reminder_chain(chat_id)
+            asyncio.create_task(log_message(chat_id, "user", ad_comment_text))
+            asyncio.create_task(log_message(chat_id, "assistant", opener))
+            log.info(f"🎯 {chat_id}: ответила на рекламный комментарий 'хочу' фиксированным приветствием")
+            if should_notify(chat_id):
+                asyncio.create_task(notify_manager(chat_id, chat_id))
+            return web.Response(text="ok")
+
     try:
         pending_buffer.setdefault(chat_id, []).append(text or "")
         old_task = pending_tasks.get(chat_id)
@@ -1083,6 +1386,8 @@ async def init_db(app: web.Application) -> None:
         await conn.execute("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS history JSONB NOT NULL DEFAULT '[]'")
         await conn.execute("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS deal_id BIGINT")
         await conn.execute("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS awaiting_reply BOOLEAN NOT NULL DEFAULT FALSE")
+        # Индекс шага цепочки напоминаний (0-4, NULL = цепочка не запланирована/завершена)
+        await conn.execute("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS reminder_step INTEGER")
         # Лог сообщений клиентов — для ежедневного отчёта Артёму (кол-во клиентов, топ-темы)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS message_log (
@@ -1138,17 +1443,27 @@ async def summarize_top_questions(texts: list[str]) -> str:
         return "— не удалось проанализировать —"
 
 
+LUNA_SHIFT_HOURS = 15  # рабочее окно Луны: 20:00-11:00 Астана = 15 часов
+
+
 async def build_and_send_daily_report() -> None:
     try:
-        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        # Отчёт шлётся в конце смены (11:00 Астана) — окно строго 20:00-11:00,
+        # а не произвольные последние 24 часа (которые раньше захватывали и
+        # нерабочее для Луны время суток).
+        since = datetime.now(timezone.utc) - timedelta(hours=LUNA_SHIFT_HOURS)
         async with db_pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT chat_id, text FROM message_log WHERE role='user' AND created_at >= $1",
                 since,
             )
-        today = datetime.now(timezone.utc).strftime("%d.%m.%Y")
+        # Дата смены — день, когда началось окно 20:00 (т.е. "вчера" относительно
+        # момента отправки отчёта в 11:00 Астана).
+        shift_date = (datetime.now(ASTANA_TZ) - timedelta(days=1)).strftime("%d.%m")
+        period_label = f"{shift_date} (20:00-11:00)"
+
         if not rows:
-            await send_whatsapp_to_manager(f"📊 Отчёт Луны за сутки ({today}): новых обращений не было.")
+            await send_whatsapp_to_manager(f"📊 Отчёт Луны за {period_label}: новых обращений не было.")
             return
 
         unique_clients = len({r["chat_id"] for r in rows})
@@ -1157,13 +1472,13 @@ async def build_and_send_daily_report() -> None:
         topics_summary = await summarize_top_questions(sample_texts)
 
         report = (
-            f"📊 Отчёт Луны за сутки ({today})\n\n"
+            f"📊 Отчёт Луны за {period_label}\n\n"
             f"👥 Уникальных клиентов: {unique_clients}\n"
             f"💬 Сообщений от клиентов: {total_messages}\n\n"
             f"🔝 Частые темы:\n{topics_summary}"
         )
         await send_whatsapp_to_manager(report)
-        log.info("📊 Ежедневный отчёт отправлен Артёму")
+        log.info("📊 Отчёт за смену отправлен Артёму")
     except Exception as e:
         log.error(f"❌ build_and_send_daily_report error: {e}")
 
@@ -1193,10 +1508,12 @@ async def init_scheduler(app: web.Application) -> None:
         replace_existing=True,
     )
 
-    # Ежедневный отчёт Артёму — 20:00 по Астане (UTC+5) = 15:00 UTC
+    # Отчёт Артёму по итогам смены Луны (20:00-11:00 Астана) — шлётся в КОНЦЕ
+    # смены, 11:00 по Астане (UTC+5) = 06:00 UTC. Раньше шёл в 20:00 (начало
+    # смены) с окном "последние 24 часа" — оба момента были некорректны.
     scheduler.add_job(
         build_and_send_daily_report,
-        CronTrigger(hour=15, minute=0),
+        CronTrigger(hour=6, minute=0),
         id="daily_report",
         replace_existing=True,
     )
