@@ -28,7 +28,6 @@ from config import (
     DATABASE_URL,
     PORT,
     BOT_PAUSED_INSTAGRAM,
-    LUNA_SCHEDULE_ENABLED,
     ARTYOM_WHATSAPP_PERSONAL,
     WAZZUP_WHATSAPP_CHANNEL_ID,
 )
@@ -153,19 +152,6 @@ pending_buffer: dict[str, list[str]] = {}
 pending_tasks: dict[str, asyncio.Task] = {}
 
 MAX_HISTORY = 20
-
-# ---------- Автографик Луны: 20:00-11:00 Астана (работает ПОСЛЕ менеджеров) ----------
-# Днём (11:00-20:00) клиентов ведут живые менеджеры — бот молчит, чтобы не мешать.
-# Аналог ночной паузы у Лолы, только окно инвертировано (Луна активна ночью).
-ASTANA_TZ = timezone(timedelta(hours=5))
-LUNA_WORK_START_HOUR = 20  # начало смены Луны, Астана
-LUNA_WORK_END_HOUR = 11    # конец смены Луны, Астана
-
-
-def is_luna_working_hours() -> bool:
-    """True, если сейчас окно 20:00-11:00 по Астане (окно переходит через полночь)."""
-    hour = datetime.now(ASTANA_TZ).hour
-    return hour >= LUNA_WORK_START_HOUR or hour < LUNA_WORK_END_HOUR
 
 
 def should_notify(chat_id: str, cooldown_seconds: int = 300) -> bool:
@@ -615,12 +601,7 @@ def detect_lang(text: str) -> str:
 
 
 def detect_demo_sent(reply: str) -> bool:
-    # ВАЖНО: ловим только реально отправленную ссылку на платформу (домен из базы
-    # знаний), а не просто упоминание слова "демо" — иначе фраза-предложение вида
-    # "Могу отправить бесплатный демо-доступ..." (шаг 8 промпта, до согласия клиента
-    # и до самой ссылки) уже засчитывалась бы как "демо отправлено" и включала
-    # напоминания, хотя ссылка ещё не отправлена.
-    demo_markers = ["skillspace.ru"]
+    demo_markers = ["skillspace.ru", "championschool.kz", "демо", "demo", "регистрац", "перейти по ссылке"]
     return any(marker in reply.lower() for marker in demo_markers)
 
 
@@ -691,28 +672,6 @@ async def handle_incoming(chat_id: str, text: str | None) -> None:
 
 
 async def _handle_incoming(chat_id: str, text: str | None) -> None:
-    # Автографик Луны: 20:00-11:00 Астана. В окно 11:00-20:00 работают живые
-    # менеджеры — бот молчит, но сообщение сохраняем в историю, чтобы контекст
-    # не терялся к моменту, когда Луна снова включится.
-    if LUNA_SCHEDULE_ENABLED and not is_luna_working_hours():
-        if text:
-            state, history, _, deal_id = await get_state(chat_id)
-            if state is None:
-                # Совсем новый лид, диалога в БД ещё нет. Не создаём строку с
-                # каким-то промежуточным state — иначе сломается ветка
-                # "state is None" (первое приветствие) при следующем сообщении.
-                # Сообщение всё равно видно менеджеру напрямую в EnvyCRM.
-                log.info(f"🌙 {chat_id}: новый лид вне графика Луны — не создаём диалог, ждём следующего сообщения")
-            else:
-                history = (history or []) + [{"role": "user", "content": text}]
-                history = history[-MAX_HISTORY:]
-                await set_state(chat_id, state, history=history, deal_id=deal_id)
-                asyncio.create_task(log_message(chat_id, "user", text))
-                log.info(f"🌙 {chat_id}: вне графика Луны (11:00-20:00 Астана — работают менеджеры), сообщение сохранено в историю, не отвечаем")
-                return
-        log.info(f"🌙 {chat_id}: вне графика Луны (11:00-20:00 Астана — работают менеджеры), не отвечаем")
-        return
-
     # Два отдельных кешируемых блока: промпт + база знаний
     kb = sheets_sync.get_cached_knowledge_base(fallback=KNOWLEDGE_BASE)
 
@@ -732,16 +691,9 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
             elapsed = (now - updated_at).total_seconds()
             if state == STATE_MANAGER and elapsed >= 1800:  # 30 мин
                 log.info(f"🔄 {chat_id} state=manager устарел (>30мин), сбрасываем")
-                # ВАЖНО: сразу пишем сброс в БД (обычным set_state, без guard).
-                # Раньше state сбрасывался только в локальной переменной — реальная
-                # запись в БД оставалась 'manager', и последующий set_state_guarded()
-                # в конце функции (у которого условие WHERE state NOT IN ('manager',...))
-                # молча не срабатывал. В итоге диалог навсегда застревал в 'manager'.
-                await set_state(chat_id, STATE_ACTIVE, history=history, deal_id=deal_id)
                 state = None
             elif state in {STATE_DONE, STATE_REFUSED} and elapsed >= 3600:
                 log.info(f"🔄 {chat_id} state={state} устарел, сбрасываем")
-                await set_state(chat_id, STATE_ACTIVE, history=history, deal_id=deal_id)
                 state = None
             else:
                 if state == STATE_MANAGER and text:
@@ -1015,13 +967,6 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
         from_user = payload.get("from_user") or {}
         crm_employee_id = from_user.get("crm_employee_id")
         if crm_employee_id and crm_employee_id != 0 and crm_employee_id > 100000:
-            # Lesson (перенесено с Лолы): EnvyCRM иногда шлёт message_reply с пустым
-            # message_text, когда менеджер просто открыл карточку клиента, ничего не
-            # печатая. Это не реальный ответ — не переводим чат в STATE_MANAGER за это.
-            if not message_text.strip():
-                log.info(f"👀 message_reply с пустым текстом (крм_employee_id={crm_employee_id}) — вероятно открытие карточки, не реальный ответ, игнорируем")
-                return web.Response(text="ok")
-
             contact = payload.get("contact") or {}
             chat_id = str(contact.get("external_id") or "").strip()
             if chat_id.startswith("inst-"):
@@ -1031,15 +976,10 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
                 if message_text and stored_last and message_text.strip() == stored_last.strip():
                     log.info(f"🔄 Эхо с crm_employee_id={crm_employee_id} — игнорируем")
                 else:
-                    # Lesson: НЕ используем общий per-chat lock здесь — если бот сейчас
-                    # генерирует ответ через Claude (держит get_lock несколько секунд),
-                    # запись STATE_MANAGER вставала бы в очередь за этим локом и не
-                    # успевала примениться до того, как бот уже отправит сообщение.
-                    # Прямая запись в БД без ожидания общего лока решает эту гонку.
-                    await set_state(chat_id, STATE_MANAGER)
-                    await clear_awaiting_reply(chat_id)
+                    async with get_lock(chat_id):
+                        await set_state(chat_id, STATE_MANAGER)
                     cancel_reminders(chat_id)
-                    log.info(f"👨‍💼 Менеджер взял {chat_id} → STATE_MANAGER (реальный ответ, таймер ожидания сброшен)")
+                    log.info(f"👨‍💼 Менеджер взял {chat_id} → STATE_MANAGER")
         return web.Response(text="ok")
 
     if event_type != "message":
@@ -1198,27 +1138,17 @@ async def summarize_top_questions(texts: list[str]) -> str:
         return "— не удалось проанализировать —"
 
 
-LUNA_SHIFT_HOURS = 15  # рабочее окно Луны: 20:00-11:00 Астана = 15 часов
-
-
 async def build_and_send_daily_report() -> None:
     try:
-        # Отчёт шлётся в конце смены (11:00 Астана) — окно строго 20:00-11:00,
-        # а не произвольные последние 24 часа (которые раньше захватывали и
-        # нерабочее для Луны время суток).
-        since = datetime.now(timezone.utc) - timedelta(hours=LUNA_SHIFT_HOURS)
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
         async with db_pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT chat_id, text FROM message_log WHERE role='user' AND created_at >= $1",
                 since,
             )
-        # Дата смены — день, когда началось окно 20:00 (т.е. "вчера" относительно
-        # момента отправки отчёта в 11:00 Астана).
-        shift_date = (datetime.now(ASTANA_TZ) - timedelta(days=1)).strftime("%d.%m")
-        period_label = f"{shift_date} (20:00-11:00)"
-
+        today = datetime.now(timezone.utc).strftime("%d.%m.%Y")
         if not rows:
-            await send_whatsapp_to_manager(f"📊 Отчёт Луны за {period_label}: новых обращений не было.")
+            await send_whatsapp_to_manager(f"📊 Отчёт Луны за сутки ({today}): новых обращений не было.")
             return
 
         unique_clients = len({r["chat_id"] for r in rows})
@@ -1227,13 +1157,13 @@ async def build_and_send_daily_report() -> None:
         topics_summary = await summarize_top_questions(sample_texts)
 
         report = (
-            f"📊 Отчёт Луны за {period_label}\n\n"
+            f"📊 Отчёт Луны за сутки ({today})\n\n"
             f"👥 Уникальных клиентов: {unique_clients}\n"
             f"💬 Сообщений от клиентов: {total_messages}\n\n"
             f"🔝 Частые темы:\n{topics_summary}"
         )
         await send_whatsapp_to_manager(report)
-        log.info("📊 Отчёт за смену отправлен Артёму")
+        log.info("📊 Ежедневный отчёт отправлен Артёму")
     except Exception as e:
         log.error(f"❌ build_and_send_daily_report error: {e}")
 
@@ -1263,12 +1193,10 @@ async def init_scheduler(app: web.Application) -> None:
         replace_existing=True,
     )
 
-    # Отчёт Артёму по итогам смены Луны (20:00-11:00 Астана) — шлётся в КОНЦЕ
-    # смены, 11:00 по Астане (UTC+5) = 06:00 UTC. Раньше шёл в 20:00 (начало
-    # смены) с окном "последние 24 часа" — оба момента были некорректны.
+    # Ежедневный отчёт Артёму — 20:00 по Астане (UTC+5) = 15:00 UTC
     scheduler.add_job(
         build_and_send_daily_report,
-        CronTrigger(hour=6, minute=0),
+        CronTrigger(hour=15, minute=0),
         id="daily_report",
         replace_existing=True,
     )
