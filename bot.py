@@ -203,27 +203,25 @@ AD_COMMENT_OPENERS = [
 
 
 def detect_ad_comment_text(payload: dict) -> str | None:
-    """Пытается вытащить текст исходного комментария из вебхука Wazzup, если
-    входящее сообщение — это автоматический DM, созданный Instagram/Wazzup
-    в ответ на комментарий к посту (а не сообщение, написанное клиентом
-    напрямую в директ).
+    """Вытаскивает текст исходного комментария из вебхука Wazzup, если входящее
+    сообщение — это автоматический DM, созданный Instagram/Wazzup в ответ на
+    комментарий к посту (а не сообщение, написанное клиентом напрямую в директ).
 
-    ⚠️ TODO / НЕ ПОДТВЕРЖДЕНО: точные названия полей в реальном вебхуке Wazzup
-    для этого сценария пока неизвестны — нет примера payload. Список ключей
-    ниже — консервативная попытка (referral/context/quoted/comment/post —
-    частые названия у похожих интеграций), но пока не проверена на реальных
-    данных. Функция специально возвращает None при любой неопределённости,
-    чтобы НЕ ломать обработку обычных сообщений в директ, пока не пришлют
-    реальный лог такого события для сверки.
+    ПОДТВЕРЖДЕНО на реальном payload (Railway log, 14.07.2026): у обычного DM
+    message_data.data == null. У сообщения, созданного из комментария к посту,
+    message_data.data — это объект с метаданными самого поста (src/likes/
+    comments/description и т.п.), а message_data.text — это ТЕКСТ КОММЕНТАРИЯ.
+    Пример реального payload:
+        "message_data": {
+            "text": "Когда начала смотреть аж поясница заболела...",
+            "data": {"src": "https://www.instagram.com/p/...", "likes": 2807,
+                      "comments": 298, "description": "...", ...}
+        }
+    Для обычного DM: "message_data": {"text": "...", "data": null}
     """
-    for key in ("referral", "context", "quotedMessage", "comment", "post"):
-        val = payload.get(key)
-        if isinstance(val, dict):
-            text = val.get("text") or val.get("comment_text")
-            if text:
-                return text
     message_data = payload.get("message_data") or {}
-    if message_data.get("type") in ("comment", "comment_reply"):
+    data = message_data.get("data")
+    if isinstance(data, dict) and ("src" in data or "comments" in data or "likes" in data):
         return message_data.get("text")
     return None
 
