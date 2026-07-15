@@ -462,29 +462,49 @@ async def start_reminder_chain(chat_id: str, anchor: datetime | None = None) -> 
 
 
 async def send_reminder_chain_step(chat_id: str, step: int) -> None:
-    try:
-        state, history, _, deal_id = await get_state(chat_id)
-        if state in REMINDER_CHAIN_BLOCKED_STATES:
-            log.info(f"⏭️ Цепочка напоминаний {chat_id} шаг {step} отменена (state={state})")
-            await save_reminder_step(chat_id, None)
-            return
-        if step >= len(REMINDER_CHAIN):
-            return
-        _, text = REMINDER_CHAIN[step]
-        log.info(f"🔔 Цепочка напоминаний: отправляю шаг {step} → {chat_id}")
-        await send_wazzup(chat_id, text)
-        history.append({"role": "assistant", "content": text})
-        await set_state(chat_id, STATE_ACTIVE, history=history, deal_id=deal_id)
-        asyncio.create_task(log_message(chat_id, "assistant", text))
-        next_step = step + 1
-        if next_step < len(REMINDER_CHAIN):
-            await save_reminder_step(chat_id, next_step)
-            schedule_reminder_chain(chat_id, next_step)
-        else:
-            log.info(f"🏁 Цепочка напоминаний для {chat_id} завершена (все 5 шагов отправлены)")
-            await save_reminder_step(chat_id, None)
-    except Exception as e:
-        log.error(f"❌ send_reminder_chain_step {step} {chat_id}: {e}")
+    # ВАЖНО: берём тот же per-chat lock, что использует обработка входящих
+    # сообщений (_handle_incoming). Без этого возможна гонка: клиент пишет
+    # ровно в момент срабатывания таймера напоминания, обе стороны почти
+    # одновременно читают/пишут reminder_step и планируют следующий шаг под
+    # одним и тем же job_id — в итоге может "выиграть" не та операция, и
+    # цепочка откатывается / повторно отправляет уже отправленный шаг.
+    async with get_lock(chat_id):
+        try:
+            # Доп. предохранитель: пока мы ждали lock, кто-то (входящее
+            # сообщение клиента) мог уже изменить reminder_step — например,
+            # отменить цепочку или продвинуть её дальше. Если текущий шаг в
+            # БД больше не совпадает с тем, что должны сейчас отправить —
+            # значит этот запуск устарел, ничего не шлём.
+            current_step = await get_reminder_step(chat_id)
+            if current_step != step:
+                log.info(
+                    f"⏭️ Цепочка напоминаний {chat_id} шаг {step} устарел "
+                    f"(текущий reminder_step={current_step}), пропускаем"
+                )
+                return
+
+            state, history, _, deal_id = await get_state(chat_id)
+            if state in REMINDER_CHAIN_BLOCKED_STATES:
+                log.info(f"⏭️ Цепочка напоминаний {chat_id} шаг {step} отменена (state={state})")
+                await save_reminder_step(chat_id, None)
+                return
+            if step >= len(REMINDER_CHAIN):
+                return
+            _, text = REMINDER_CHAIN[step]
+            log.info(f"🔔 Цепочка напоминаний: отправляю шаг {step} → {chat_id}")
+            await send_wazzup(chat_id, text)
+            history.append({"role": "assistant", "content": text})
+            await set_state(chat_id, STATE_ACTIVE, history=history, deal_id=deal_id)
+            asyncio.create_task(log_message(chat_id, "assistant", text))
+            next_step = step + 1
+            if next_step < len(REMINDER_CHAIN):
+                await save_reminder_step(chat_id, next_step)
+                schedule_reminder_chain(chat_id, next_step)
+            else:
+                log.info(f"🏁 Цепочка напоминаний для {chat_id} завершена (все 5 шагов отправлены)")
+                await save_reminder_step(chat_id, None)
+        except Exception as e:
+            log.error(f"❌ send_reminder_chain_step {step} {chat_id}: {e}")
 
 
 async def classify_reminder_response(text: str) -> str:
@@ -493,10 +513,15 @@ async def classify_reminder_response(text: str) -> str:
     хотя бы один шаг цепочки (reminder_step >= 1) — то есть он реагирует
     именно на напоминание, а не продолжает обычный диалог.
 
-    'soft'     — расплывчатый/отложенный ответ без конкретики
-                 ("я подумаю", "ок", "хорошо", эмодзи, "занята сейчас" и т.п.)
-    'critical' — реальный вопрос, возражение, готовность обсуждать детали —
-                 требует содержательного ответа по существу.
+    'soft'      — расплывчатый/отложенный ответ без конкретики
+                  ("я подумаю", "ок", "хорошо", эмодзи, "занята сейчас" и т.п.)
+    'critical'  — реальный вопрос, возражение, готовность обсуждать детали —
+                  требует содержательного ответа по существу, интерес сохраняется.
+    'disengage' — клиент вежливо, но ясно даёт понять, что предложение ему
+                  больше не актуально/не по адресу ("я уже обучен(а)", "я уже
+                  ваш клиент", "не туда попал", "уже прошёл курс в другом
+                  месте") — не грубый отказ, но и не интерес, продолжать
+                  цепочку не нужно.
     При ошибке классификации безопасный дефолт — 'critical' (лучше ответить
     по существу, чем молча продолжить автоматическую рассылку)."""
     try:
@@ -511,12 +536,18 @@ async def classify_reminder_response(text: str) -> str:
                 "конкретики (например 'я подумаю', 'ок', 'хорошо', 'сейчас занята', "
                 "просто эмодзи, любое подтверждение без вопроса по существу). "
                 "'critical' — содержит реальный вопрос, возражение, готовность "
-                "обсуждать детали — что угодно, требующее содержательного ответа "
-                "по курсу. Ответь ОДНИМ словом: soft или critical. Больше ничего не пиши."
+                "обсуждать детали — интерес к обучению сохраняется. "
+                "'disengage' — клиент вежливо даёт понять, что предложение больше "
+                "не актуально или не по адресу (например 'я уже обучен(а)', 'я уже "
+                "прошёл курс', 'я уже ваш клиент', 'не туда попал', 'уже записан "
+                "в другом месте') — не грубый отказ, но продолжать не нужно. "
+                "Ответь ОДНИМ словом: soft, critical или disengage. Больше ничего не пиши."
             ),
             messages=[{"role": "user", "content": text}],
         )
         result = msg.content[0].text.strip().lower()
+        if "disengage" in result:
+            return "disengage"
         return "soft" if "soft" in result else "critical"
     except Exception as e:
         log.error(f"❌ classify_reminder_response error: {e}")
@@ -1074,9 +1105,23 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
     # СЛЕДУЮЩИЙ шаг цепочки на его собственную дельту от этого момента, не сбрасывая
     # всю цепочку) или "критичный" (тогда отвечаем по существу как обычно, и уже
     # обычная логика ниже перезапустит цепочку с нуля после отправки ответа).
+    disengaged = False
     if reminder_step_before is not None and reminder_step_before >= 1:
         response_type = await classify_reminder_response(text)
-        if response_type == "soft":
+        if response_type == "disengage":
+            # Клиент вежливо даёт понять, что предложение больше не актуально
+            # ("я уже обучен(а)", "уже ваш клиент" и т.п.) — не грубый отказ,
+            # но продолжать цепочку не нужно. Отвечаем один раз по существу
+            # через обычный Claude-флоу, а цепочку останавливаем насовсем
+            # (как при явном отказе), а не перезапускаем с нуля.
+            cancel_reminder_chain(chat_id)
+            await save_reminder_step(chat_id, None)
+            disengaged = True
+            log.info(f"🚪 {chat_id}: клиент вне ЦА по ответу на напоминание ({text[:100]!r}), цепочка остановлена насовсем")
+            # Дальше просто продолжаем обычной веткой ниже — Claude ответит по
+            # существу, но start_reminder_chain() в конце не будет вызван,
+            # т.к. ниже это условие проверяется через флаг disengaged.
+        elif response_type == "soft":
             history.append({"role": "user", "content": text})
             history = history[-MAX_HISTORY:]
             try:
@@ -1151,9 +1196,12 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
         await set_state_guarded(chat_id, STATE_DEMO_SENT, history=history)
     else:
         await set_state_guarded(chat_id, STATE_ACTIVE, history=history)
-    # Любое исходящее сообщение (в т.ч. этот обычный/критичный ответ) заново
-    # запускает цепочку напоминаний с шага 0 (первое напоминание — через 1 час).
-    await start_reminder_chain(chat_id)
+    if not disengaged:
+        # Любое исходящее сообщение (в т.ч. этот обычный/критичный ответ) заново
+        # запускает цепочку напоминаний с шага 0 (первое напоминание — через 1 час).
+        await start_reminder_chain(chat_id)
+    else:
+        log.info(f"🚪 {chat_id}: цепочка не перезапускается (клиент вне ЦА)")
 
     if should_notify(chat_id):
         asyncio.create_task(notify_manager(chat_id, chat_id, known_deal_id=deal_id))
