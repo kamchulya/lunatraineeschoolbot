@@ -157,6 +157,7 @@ FAREWELL_MSGS = {
 
 REFUSE_WORDS = [
     "не надо", "не интересно", "нет спасибо", "не хочу", "не нужно",
+    "отвали", "отстань", "отстаньте", "не актуально",
     "қажет емес", "жоқ рахмет",
 ]
 
@@ -754,8 +755,61 @@ def extract_phone(text: str) -> str | None:
 
 
 def is_refusal(text: str) -> bool:
-    lower = text.lower()
+    lower = text.lower().strip()
+    # "нет" само по себе слишком частое слово в обычных фразах ("нет времени",
+    # "нет, не в этом дело") — засчитываем его как отказ ТОЛЬКО если это весь
+    # ответ целиком (короткое "нет" / "Нет." / "нет!!"), а не подстрока внутри
+    # длинного сообщения.
+    stripped = lower.rstrip(".!? ")
+    if stripped in ("нет", "жоқ"):
+        return True
+    if "заеб" in lower:  # без \b — "заебал"/"заебала" не имеют границы слова после корня
+        return True
     return any(re.search(r'\b' + re.escape(p) + r'\b', lower) for p in REFUSE_WORDS)
+
+
+WHATSAPP_HANDOFF_KEYWORDS = ["ватсап", "вацап", "вотсап", "whatsapp", "вотсапп", "ватцап"]
+
+
+def mentions_whatsapp(text: str) -> bool:
+    """Дешёвая предфильтрация: упоминается ли WhatsApp вообще. Используется
+    только чтобы решить, стоит ли вызывать классификатор ниже — сама по себе
+    НЕ означает подтверждение переноса разговора (см. classify_whatsapp_mention)."""
+    lower = (text or "").lower()
+    return any(kw in lower for kw in WHATSAPP_HANDOFF_KEYWORDS)
+
+
+async def classify_whatsapp_mention(text: str) -> bool:
+    """Разделяет ДВА разных случая, которые по ключевым словам выглядят
+    одинаково: менеджер ЗАПРОСИЛ номер WhatsApp у клиента ("поделитесь,
+    пожалуйста, номером ватсап") — тогда клиент мог не ответить, и разговор
+    в Instagram ещё не завершён, напоминания нужны как обычно — vs менеджер
+    ПОДТВЕРДИЛ перенос разговора ("менеджер напишет Вам на ватсап") — тогда
+    Instagram-тред закрыт, автоматические напоминания здесь больше не нужны.
+    Возвращает True только во втором случае (handoff)."""
+    try:
+        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        msg = await client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=5,
+            temperature=0,
+            system=(
+                "Менеджер фитнес-школы написал клиенту сообщение, упоминающее "
+                "WhatsApp. Определи тип сообщения. 'handoff' — менеджер "
+                "ПОДТВЕРЖДАЕТ, что сам напишет/свяжется с клиентом в WhatsApp "
+                "(разговор переносится туда, здесь его можно закрывать). "
+                "'request' — менеджер ЗАПРАШИВАЕТ номер WhatsApp у клиента, "
+                "задаёт вопрос или уточняет (клиент мог не ответить, разговор "
+                "в этом канале ещё не завершён). Ответь ОДНИМ словом: "
+                "handoff или request."
+            ),
+            messages=[{"role": "user", "content": text}],
+        )
+        result = msg.content[0].text.strip().lower()
+        return "handoff" in result
+    except Exception as e:
+        log.error(f"❌ classify_whatsapp_mention error: {e}")
+        return False  # безопасный дефолт — не отменяем напоминания, если не уверены
 
 
 def detect_lang(text: str) -> str:
@@ -1251,8 +1305,14 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
                     # Прямая запись в БД без ожидания общего лока решает эту гонку.
                     await set_state(chat_id, STATE_MANAGER)
                     await clear_awaiting_reply(chat_id)
-                    await start_reminder_chain(chat_id)
-                    log.info(f"👨‍💼 Менеджер взял {chat_id} → STATE_MANAGER (реальный ответ, цепочка напоминаний перезапущена от сообщения менеджера)")
+                    is_handoff = mentions_whatsapp(message_text) and await classify_whatsapp_mention(message_text)
+                    if is_handoff:
+                        cancel_reminder_chain(chat_id)
+                        await save_reminder_step(chat_id, None)
+                        log.info(f"👨‍💼 Менеджер взял {chat_id} → STATE_MANAGER (подтверждён перенос в WhatsApp, напоминания в Instagram отключены)")
+                    else:
+                        await start_reminder_chain(chat_id)
+                        log.info(f"👨‍💼 Менеджер взял {chat_id} → STATE_MANAGER (реальный ответ, цепочка напоминаний перезапущена от сообщения менеджера)")
         return web.Response(text="ok")
 
     if event_type != "message":
@@ -1277,7 +1337,14 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
     crm_employee_id = from_user.get("crm_employee_id")
     if crm_employee_id is not None and crm_employee_id != 0 and crm_employee_id > 100000:
         await set_state(chat_id, STATE_MANAGER)
-        await start_reminder_chain(chat_id)
+        manager_text = (payload.get("message_data") or {}).get("text") or ""
+        is_handoff = mentions_whatsapp(manager_text) and await classify_whatsapp_mention(manager_text)
+        if is_handoff:
+            cancel_reminder_chain(chat_id)
+            await save_reminder_step(chat_id, None)
+            log.info(f"👨‍💼 {chat_id} → STATE_MANAGER (подтверждён перенос в WhatsApp, напоминания в Instagram отключены)")
+        else:
+            await start_reminder_chain(chat_id)
         return web.Response(text="ok")
 
     message_data = payload.get("message_data") or {}
