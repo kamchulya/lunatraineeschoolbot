@@ -454,11 +454,20 @@ def cancel_reminder_chain(chat_id: str) -> None:
         log.info(f"🗑️ Отменена запланированная цепочка напоминаний для {chat_id}")
 
 
-async def start_reminder_chain(chat_id: str, anchor: datetime | None = None) -> None:
+async def start_reminder_chain(chat_id: str, anchor: datetime | None = None, start_step: int = 0) -> None:
     """Вызывается после ЛЮБОГО нашего исходящего сообщения (бот или менеджер) —
-    перезапускает цепочку с шага 0 (первое напоминание — через 1 час)."""
-    schedule_reminder_chain(chat_id, 0, anchor=anchor)
-    await save_reminder_step(chat_id, 0)
+    запускает/перезапускает цепочку с шага start_step (по умолчанию 0 — первое
+    напоминание через 1 час). Если анкер — сообщение МЕНЕДЖЕРА, а не бота,
+    вызывающий код передаёт start_step=REMINDER_CHAIN_MANAGER_START_STEP —
+    цепочка тогда стартует сразу с 3-го шага (5 часов), пропуская ранние 1ч/3ч
+    напоминания, которые для менеджерских рассылок ощущаются слишком навязчиво."""
+    schedule_reminder_chain(chat_id, start_step, anchor=anchor)
+    await save_reminder_step(chat_id, start_step)
+
+
+# 3-й шаг цепочки (индекс 2, считая с 0) = 5 часов — именно с него стартуем,
+# если последним написал менеджер, а не бот.
+REMINDER_CHAIN_MANAGER_START_STEP = 2
 
 
 async def send_reminder_chain_step(chat_id: str, step: int) -> None:
@@ -1359,8 +1368,8 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
                         await save_reminder_step(chat_id, None)
                         log.info(f"👨‍💼 Менеджер взял {chat_id} → STATE_MANAGER (подтверждён перенос в WhatsApp, напоминания в Instagram отключены)")
                     else:
-                        await start_reminder_chain(chat_id)
-                        log.info(f"👨‍💼 Менеджер взял {chat_id} → STATE_MANAGER (реальный ответ, цепочка напоминаний перезапущена от сообщения менеджера)")
+                        await start_reminder_chain(chat_id, start_step=REMINDER_CHAIN_MANAGER_START_STEP)
+                        log.info(f"👨‍💼 Менеджер взял {chat_id} → STATE_MANAGER (реальный ответ, цепочка напоминаний запущена с 3-го шага/5ч от сообщения менеджера)")
         return web.Response(text="ok")
 
     if event_type != "message":
@@ -1392,7 +1401,7 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
             await save_reminder_step(chat_id, None)
             log.info(f"👨‍💼 {chat_id} → STATE_MANAGER (подтверждён перенос в WhatsApp, напоминания в Instagram отключены)")
         else:
-            await start_reminder_chain(chat_id)
+            await start_reminder_chain(chat_id, start_step=REMINDER_CHAIN_MANAGER_START_STEP)
         return web.Response(text="ok")
 
     message_data = payload.get("message_data") or {}
