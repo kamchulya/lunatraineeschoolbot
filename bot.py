@@ -29,7 +29,6 @@ from config import (
     PORT,
     BOT_PAUSED_INSTAGRAM,
     LUNA_SCHEDULE_ENABLED,
-    PUBLIC_BASE_URL,
     ARTYOM_WHATSAPP_PERSONAL,
     WAZZUP_WHATSAPP_CHANNEL_ID,
 )
@@ -527,15 +526,8 @@ async def send_wazzup_file(chat_id: str, file_url: str, caption: str = "") -> No
     log.error(f"❌ Wazzup file: все 3 попытки провалились для {chat_id}")
 
 
-def get_dogovor_url() -> str | None:
-    """Ссылка на веб-страницу с текстом договора, если PUBLIC_BASE_URL задан
-    в Railway Variables (домен сервиса из Settings → Networking)."""
-    return f"https://{PUBLIC_BASE_URL}/dogovor" if PUBLIC_BASE_URL else None
-
-
-def get_dogovor_pdf_url() -> str | None:
-    """Прямая ссылка на сам файл договора (PDF со штампом)."""
-    return f"https://{PUBLIC_BASE_URL}/static/dogovor.pdf" if PUBLIC_BASE_URL else None
+# Ссылки на договор захардкожены в knowledge_base.py (см. блок "ДОГОВОР"),
+# домен известен: web-production-5bd41.up.railway.app.
 
 
 # ---------- APScheduler: цепочка напоминаний при молчании клиента ----------
@@ -1071,23 +1063,6 @@ def detect_demo_sent(reply: str) -> bool:
     return any(marker in reply.lower() for marker in demo_markers)
 
 
-def get_knowledge_base() -> str:
-    """Обёртка над sheets_sync.get_cached_knowledge_base(), которая дописывает
-    ссылку на договор (публичная оферта) — не зависит от того, откуда взята
-    остальная база (Sheets или fallback KNOWLEDGE_BASE), и не требует правки
-    самого текста базы знаний вручную. Пока PUBLIC_BASE_URL не задан в Railway
-    Variables — блок про договор просто не добавляется, и бот ведёт себя как
-    раньше (без ссылки на договор)."""
-    kb = sheets_sync.get_cached_knowledge_base(fallback=KNOWLEDGE_BASE)
-    if dogovor_url:
-        kb += (
-            "\n\n=== ДОГОВОР (ПУБЛИЧНАЯ ОФЕРТА) ===\n\n"
-            f"Ссылка на договор (веб-страница с полным текстом): {dogovor_url}\n"
-            f"Ссылка на оригинал PDF со штампом (если клиент просит именно файл): {get_dogovor_pdf_url()}\n"
-        )
-    return kb
-
-
 async def claude_reply(messages: list[dict], system_prompt: str | None = None, kb: str | None = None) -> str:
     # Убираем ведущие assistant-сообщения
     while messages and messages[0].get("role") == "assistant":
@@ -1192,7 +1167,7 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
         return
 
     # Два отдельных кешируемых блока: промпт + база знаний
-    kb = get_knowledge_base()
+    kb = sheets_sync.get_cached_knowledge_base(fallback=KNOWLEDGE_BASE)
 
     state, history, updated_at, deal_id = await get_state(chat_id)
     reminder_step_before = await get_reminder_step(chat_id) if text else None
@@ -1463,7 +1438,7 @@ async def _answer_pending(chat_id: str) -> None:
         return
 
     text = history[-1].get("content", "")
-    kb = get_knowledge_base()
+    kb = sheets_sync.get_cached_knowledge_base(fallback=KNOWLEDGE_BASE)
 
     try:
         reply = await claude_reply(history, SYSTEM_PROMPT, kb=kb)
