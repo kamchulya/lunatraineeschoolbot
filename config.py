@@ -47,3 +47,9 @@ BOT_PAUSED_INSTAGRAM = os.getenv("BOT_PAUSED_INSTAGRAM", "false").lower() == "tr
 # Kill switch — поставить "false" в Railway, чтобы временно отключить график
 # (например для отладки), не трогая код. Сами часы заданы в bot.py.
 LUNA_SCHEDULE_ENABLED = os.getenv("LUNA_SCHEDULE_ENABLED", "true").lower() == "true"
+
+# Публичный домен этого же Railway-сервиса (Settings → Networking → Public
+# Networking в Railway, вида "lunatraineeschoolbot-production.up.railway.app",
+# БЕЗ https:// и БЕЗ слэша на конце) — нужен, чтобы бот мог собрать ссылку на
+# страницу договора /dogovor. Пока не заполнено — ссылка на договор не шлётся.
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")

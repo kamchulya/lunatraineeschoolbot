@@ -29,6 +29,7 @@ from config import (
     PORT,
     BOT_PAUSED_INSTAGRAM,
     LUNA_SCHEDULE_ENABLED,
+    PUBLIC_BASE_URL,
     ARTYOM_WHATSAPP_PERSONAL,
     WAZZUP_WHATSAPP_CHANNEL_ID,
 )
@@ -226,6 +227,73 @@ def detect_ad_comment_text(payload: dict) -> str | None:
         return message_data.get("text")
     return None
 
+
+# ---------- Сценарий 1: обычные комментарии под постами ----------
+# Комментарий, который не содержит слова "хочу" (это отдельный Сценарий 2) и не
+# состоит только из эмодзи — Луна должна ответить: если в тексте есть вопрос,
+# коротко ответить по существу; если это похвала/эмоция без вопроса —
+# поблагодарить. В обоих случаях — ненавязчиво пригласить узнать больше о школе.
+# Различие "вопрос / не вопрос" оставляем на усмотрение модели (Haiku) — это
+# естественная языковая классификация, жёстко кодировать её эвристиками ненадёжно.
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U00002190-\U000021FF"
+    "\U00002B00-\U00002BFF"
+    "\U0001F900-\U0001F9FF"
+    "\uFE0F"
+    "\u200d"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def is_emoji_only_comment(text: str) -> bool:
+    """True, если после удаления эмодзи и пунктуации от комментария не
+    остаётся ни одной буквы/цифры — по ТЗ такие комментарии игнорируем молча,
+    не отвечаем вообще (ни благодарностью, ни приглашением)."""
+    stripped = EMOJI_PATTERN.sub("", text or "")
+    stripped = re.sub(r"[\s.,!?\-_+:;()'\"«»]+", "", stripped)
+    return len(stripped) == 0
+
+
+async def generate_comment_reply(comment_text: str) -> str:
+    """Генерирует ответ в директ на обычный комментарий под постом (Сценарий 1,
+    не 'хочу' и не розыгрыш). Короткий, дружелюбный, экспертный, мотивирует
+    продолжить общение — без цен/форматов/дат, это только первый контакт."""
+    try:
+        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        msg = await client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=200,
+            temperature=0.3,
+            system=(
+                "Ты — Луна, помощник Champion School (школа подготовки фитнес-тренеров "
+                "в Казахстане). Клиент оставил комментарий под постом школы в Instagram, "
+                "тебе нужно ответить ему личным сообщением в директ.\n\n"
+                "Правила:\n"
+                "— Если в комментарии есть реальный вопрос — коротко и по-дружески "
+                "ответь по существу, затем ненавязчиво спроси, интересно ли узнать "
+                "подробнее об обучении в школе.\n"
+                "— Если комментарий без вопроса, просто эмоция или похвала ('класс', "
+                "'супер', 'отлично', 'молодцы' и т.п.) — поблагодари за активность и "
+                "так же ненавязчиво спроси, интересно ли узнать подробнее об обучении.\n"
+                "— Пиши на языке комментария (русский или казахский).\n"
+                "— Коротко: 2-4 предложения, женский род (Луна — женский помощник), "
+                "максимум 1 эмодзи, без markdown-разметки.\n"
+                "— Не называй цены, форматы обучения, даты стартов — это ещё не этап "
+                "консультации, а первый контакт после комментария."
+            ),
+            messages=[{"role": "user", "content": comment_text}],
+        )
+        reply = msg.content[0].text.strip()
+        return reply or "Спасибо за комментарий! 😊 Хотите узнать подробнее про обучение в нашей школе?"
+    except Exception as e:
+        log.error(f"❌ generate_comment_reply error: {e}")
+        return "Спасибо за комментарий! 😊 Хотите узнать подробнее про обучение в нашей школе?"
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
@@ -421,6 +489,55 @@ async def send_wazzup(chat_id: str, text: str) -> None:
     log.error(f"❌ Wazzup: все 3 попытки провалились для {chat_id}")
 
 
+# ---------- Wazzup: отправка файла (договор PDF) ----------
+# ВАЖНО: Wazzup поддерживает поле "contentUri" вместо "text" для отправки файла
+# по прямой ссылке — это стандартный для Wazzup формат для документов/картинок.
+# НЕ проверено вживую на этом канале (Instagram) — перед тем как полагаться на
+# автоматическую отправку самого PDF в чат, проверить по Railway-логам
+# ("📎 Wazzup file →") и глазами в Instagram, что файл реально пришёл, а не
+# просто текстовая ссылка. Если контент не доходит — можно временно
+# ограничиться только текстовой ссылкой на /dogovor (см. get_dogovor_url ниже),
+# это гарантированно работает, т.к. использует уже проверенный send_wazzup().
+async def send_wazzup_file(chat_id: str, file_url: str, caption: str = "") -> None:
+    url = "https://api.wazzup24.com/v3/message"
+    headers = {
+        "Authorization": f"Bearer {WAZZUP_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "channelId": WAZZUP_INSTAGRAM_CHANNEL_ID,
+        "chatId": chat_id,
+        "chatType": "instagram",
+        "contentUri": file_url,
+    }
+    if caption:
+        body["text"] = caption
+    delays = [0, 2, 4]
+    for attempt, delay in enumerate(delays):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            async with http_session.post(url, json=body, headers=headers) as resp:
+                result = await resp.text()
+                log.info(f"📎 Wazzup file → {chat_id} attempt={attempt+1} [{resp.status}]: {result[:200]}")
+                if resp.status < 500:
+                    return
+        except Exception as e:
+            log.warning(f"⚠️ Wazzup file attempt {attempt+1} error: {e}")
+    log.error(f"❌ Wazzup file: все 3 попытки провалились для {chat_id}")
+
+
+def get_dogovor_url() -> str | None:
+    """Ссылка на веб-страницу с текстом договора, если PUBLIC_BASE_URL задан
+    в Railway Variables (домен сервиса из Settings → Networking)."""
+    return f"https://{PUBLIC_BASE_URL}/dogovor" if PUBLIC_BASE_URL else None
+
+
+def get_dogovor_pdf_url() -> str | None:
+    """Прямая ссылка на сам файл договора (PDF со штампом)."""
+    return f"https://{PUBLIC_BASE_URL}/static/dogovor.pdf" if PUBLIC_BASE_URL else None
+
+
 # ---------- APScheduler: цепочка напоминаний при молчании клиента ----------
 def schedule_reminder_chain(chat_id: str, step: int, anchor: datetime | None = None) -> None:
     """Планирует шаг step цепочки (0-based) через REMINDER_CHAIN[step] секунд
@@ -563,6 +680,70 @@ async def classify_reminder_response(text: str) -> str:
         return "critical"
 
 
+# ---------- EnvyCRM: перенос на этап "Чат-бот" ----------
+# ID найдены выгрузкой /openapi/v1/crm/get (15.07.2026). У сделки есть ДВЕ
+# разные воронки с разными stage_id для одноимённого этапа "Чат - бот":
+#   pipeline "ВХОДЯЩИЕ"       (pipeline_id 294838) → stage_id 1782254
+#   pipeline "Школа Фитнеса"  (pipeline_id 316677) → stage_id 1782251
+# Метод для смены этапа — /openapi/v1/deal/updateDealStage, подтверждён
+# рабочим кодом Лолы (escalate_to_involvement / update_deal_stage).
+ENVY_PIPELINE_INCOMING = 294838
+ENVY_PIPELINE_FITNESS = 316677
+ENVY_STAGE_CHATBOT_INCOMING = 1782254
+ENVY_STAGE_CHATBOT_FITNESS = 1782251
+
+ENVY_CHATBOT_STAGE_BY_PIPELINE = {
+    ENVY_PIPELINE_INCOMING: ENVY_STAGE_CHATBOT_INCOMING,
+    ENVY_PIPELINE_FITNESS: ENVY_STAGE_CHATBOT_FITNESS,
+}
+
+
+async def update_deal_stage(deal_id: int, stage_id: int) -> bool:
+    """Переводит сделку на указанный этап воронки через /deal/updateDealStage
+    (тот же метод, что уже подтверждён и работает в боте Лолы).
+    Возвращает True при успехе (200), False при ошибке."""
+    try:
+        headers = {"Content-Type": "application/json"}
+        url = f"{ENVY_CRM_URL}/openapi/v1/deal/updateDealStage?api_key={ENVY_API_KEY}"
+        body = {"deal_id": deal_id, "stage_id": stage_id}
+        async with http_session.post(url, json=body, headers=headers) as resp:
+            result = await resp.text()
+            log.info(f"🏷️ deal/updateDealStage deal_id={deal_id} stage_id={stage_id} [{resp.status}]: {result[:200]}")
+            return resp.status == 200
+    except Exception as e:
+        log.error(f"❌ update_deal_stage error deal_id={deal_id}: {e}")
+        return False
+
+
+async def move_deal_to_chatbot_stage(deal_id: int) -> None:
+    """По ТЗ клиента: как только бот ведёт ПОЛНОЦЕННЫЙ диалог с клиентом (не
+    просто шлёт автоматическое напоминание), сделка должна переехать на этап
+    "Чат-бот" в своей воронке — для всех клиентов, включая старых из базы.
+    Обратного переноса при переходе в режим напоминаний быть не должно —
+    вызывающий код просто не дёргает эту функцию из send_reminder_chain_step(),
+    так что состояние "Чат-бот" само по себе никогда не откатывается отсюда.
+    Идемпотентно — повторный вызов для сделки, уже стоящей на этом этапе,
+    безопасен."""
+    try:
+        headers = {"Content-Type": "application/json"}
+        url_get = f"{ENVY_CRM_URL}/openapi/v1/deal/get?api_key={ENVY_API_KEY}"
+        async with http_session.post(url_get, json={"deal_id": deal_id}, headers=headers) as resp:
+            data = await resp.json()
+        pipeline_id = (data.get("result") or {}).get("pipeline_id")
+
+        stage_id = ENVY_CHATBOT_STAGE_BY_PIPELINE.get(pipeline_id)
+        if stage_id is None:
+            log.warning(
+                f"⚠️ move_deal_to_chatbot_stage: неизвестный pipeline_id={pipeline_id} "
+                f"для deal_id={deal_id} (ожидались {list(ENVY_CHATBOT_STAGE_BY_PIPELINE)}), пропускаем"
+            )
+            return
+
+        await update_deal_stage(deal_id, stage_id)
+    except Exception as e:
+        log.error(f"❌ move_deal_to_chatbot_stage error deal_id={deal_id}: {e}")
+
+
 # ---------- EnvyCRM ----------
 async def find_lead(username: str, phone: str | None = None, retries: int = 3, delay: float = 3.0) -> int | None:
     url = f"{ENVY_CRM_URL}/openapi/v1/lead/list?api_key={ENVY_API_KEY}"
@@ -663,11 +844,27 @@ async def send_whatsapp_to_manager(text: str) -> None:
     log.error("❌ WhatsApp → Артём: все 3 попытки провалились")
 
 
-UNKNOWN_ANSWER_MARKER = "передала ваш вопрос менеджеру"
+# ВАЖНО: раньше здесь была ОДНА строгая фраза-маркер ("передала ваш вопрос
+# менеджеру"), которая не встречается НИ В ОДНОЙ из канонических формулировок
+# эскалации, реально прописанных в prompt.py (см. блок ЭСКАЛАЦИЯ и СТОП-ПРАВИЛА):
+# "Минуту, переключаю на менеджера...", "Записала Ваш вопрос, менеджер
+# свяжется...", "Уточню у менеджера — свяжется с подробностями.",
+# "Записала Ваш вопрос по оплате, менеджер поможет разобраться." — из-за этого
+# detect_unknown_answer() практически никогда не срабатывал, и уведомление
+# Артёму в WhatsApp не уходило, даже когда Луна реально обещала клиенту
+# передать вопрос менеджеру. Проверяем по набору фраз, которые модель реально
+# использует согласно промпту.
+UNKNOWN_ANSWER_MARKERS = [
+    "переключаю на менеджера",
+    "записала ваш вопрос",
+    "записала вашу просьбу",
+    "уточню у менеджера",
+]
 
 
 def detect_unknown_answer(reply: str) -> bool:
-    return UNKNOWN_ANSWER_MARKER in (reply or "").lower()
+    lower = (reply or "").lower()
+    return any(marker in lower for marker in UNKNOWN_ANSWER_MARKERS)
 
 
 async def extract_client_info(history: list) -> tuple[str | None, str | None]:
@@ -874,16 +1071,47 @@ def detect_demo_sent(reply: str) -> bool:
     return any(marker in reply.lower() for marker in demo_markers)
 
 
+def get_knowledge_base() -> str:
+    """Обёртка над sheets_sync.get_cached_knowledge_base(), которая дописывает
+    ссылку на договор (публичная оферта) — не зависит от того, откуда взята
+    остальная база (Sheets или fallback KNOWLEDGE_BASE), и не требует правки
+    самого текста базы знаний вручную. Пока PUBLIC_BASE_URL не задан в Railway
+    Variables — блок про договор просто не добавляется, и бот ведёт себя как
+    раньше (без ссылки на договор)."""
+    kb = sheets_sync.get_cached_knowledge_base(fallback=KNOWLEDGE_BASE)
+    if dogovor_url:
+        kb += (
+            "\n\n=== ДОГОВОР (ПУБЛИЧНАЯ ОФЕРТА) ===\n\n"
+            f"Ссылка на договор (веб-страница с полным текстом): {dogovor_url}\n"
+            f"Ссылка на оригинал PDF со штампом (если клиент просит именно файл): {get_dogovor_pdf_url()}\n"
+        )
+    return kb
+
+
 async def claude_reply(messages: list[dict], system_prompt: str | None = None, kb: str | None = None) -> str:
     # Убираем ведущие assistant-сообщения
     while messages and messages[0].get("role") == "assistant":
         messages = messages[1:]
-    # Убираем подряд идущие одинаковые роли
+    # Anthropic API требует строгого чередования ролей user/assistant. Подряд
+    # идущие сообщения одной роли РЕАЛЬНО случаются — например несколько
+    # сообщений клиента подряд, пока чат в STATE_MANAGER и ни бот, ни менеджер
+    # ещё не ответили (см. save_pending_message). ВАЖНО: раньше такие
+    # сообщения просто ВЫБРАСЫВАЛИСЬ (continue без добавления) — модель никогда
+    # не видела второе и последующие сообщения клиента в таком блоке, из-за
+    # чего Луна теряла контекст и отвечала мимо того, что клиент реально
+    # написал последним. Вместо потери — склеиваем содержимое подряд идущих
+    # сообщений одной роли в одно сообщение.
     cleaned = []
     for msg in messages:
-        if cleaned and cleaned[-1]["role"] == msg["role"]:
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if cleaned and cleaned[-1]["role"] == role:
+            cleaned[-1] = {
+                "role": role,
+                "content": cleaned[-1]["content"] + "\n" + content,
+            }
             continue
-        cleaned.append(msg)
+        cleaned.append({"role": role, "content": content})
     messages = cleaned
     while messages and messages[0].get("role") == "assistant":
         messages = messages[1:]
@@ -964,7 +1192,7 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
         return
 
     # Два отдельных кешируемых блока: промпт + база знаний
-    kb = sheets_sync.get_cached_knowledge_base(fallback=KNOWLEDGE_BASE)
+    kb = get_knowledge_base()
 
     state, history, updated_at, deal_id = await get_state(chat_id)
     reminder_step_before = await get_reminder_step(chat_id) if text else None
@@ -1058,6 +1286,11 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
         # Цепочка напоминаний запускается после ЛЮБОГО нашего сообщения, в том
         # числе после самого первого приветствия — если лид вообще не ответил.
         await start_reminder_chain(chat_id)
+        # Перенос на этап "Чат-бот" в CRM — только если deal_id уже известен
+        # (для совсем нового лида он обычно ещё не резолвится, найдётся на
+        # следующих репликах через notify_manager/lead_to_inbox).
+        if deal_id:
+            asyncio.create_task(move_deal_to_chatbot_stage(deal_id))
 
         if should_notify(chat_id):
             asyncio.create_task(notify_manager(chat_id, chat_id, known_deal_id=deal_id))
@@ -1162,6 +1395,8 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
             await send_wazzup(chat_id, soft_reply)
             asyncio.create_task(log_message(chat_id, "assistant", soft_reply))
             await set_state_guarded(chat_id, STATE_ACTIVE, history=history)
+            if deal_id:
+                asyncio.create_task(move_deal_to_chatbot_stage(deal_id))
             # Не сбрасываем цепочку на шаг 0 — переносим ИМЕННО следующий
             # запланированный шаг на его собственную дельту от текущего момента.
             anchor_now = datetime.now(timezone.utc)
@@ -1205,6 +1440,8 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
         await set_state_guarded(chat_id, STATE_DEMO_SENT, history=history)
     else:
         await set_state_guarded(chat_id, STATE_ACTIVE, history=history)
+    if deal_id:
+        asyncio.create_task(move_deal_to_chatbot_stage(deal_id))
     if not disengaged:
         # Любое исходящее сообщение (в т.ч. этот обычный/критичный ответ) заново
         # запускает цепочку напоминаний с шага 0 (первое напоминание — через 1 час).
@@ -1226,7 +1463,7 @@ async def _answer_pending(chat_id: str) -> None:
         return
 
     text = history[-1].get("content", "")
-    kb = sheets_sync.get_cached_knowledge_base(fallback=KNOWLEDGE_BASE)
+    kb = get_knowledge_base()
 
     try:
         reply = await claude_reply(history, SYSTEM_PROMPT, kb=kb)
@@ -1255,6 +1492,8 @@ async def _answer_pending(chat_id: str) -> None:
     last_bot_reply[chat_id] = reply
     await set_state(chat_id, STATE_ACTIVE, history=history)
     await start_reminder_chain(chat_id)
+    if deal_id:
+        asyncio.create_task(move_deal_to_chatbot_stage(deal_id))
 
 
 async def resume_unanswered_manager_chats() -> None:
@@ -1445,30 +1684,50 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
         await set_state(chat_id, STATE_SMM)
         return web.Response(text="ok")
 
-    # ---------- Таргет-реклама: комментарий "хочу" → авто-DM ----------
+    # ---------- Таргет-реклама / комментарии под постами ----------
     # Применяем только к новым диалогам (ещё нет state в БД) — чтобы случайно
     # не перехватить обработку у уже идущего разговора.
     ad_comment_text = detect_ad_comment_text(payload)
     if ad_comment_text is not None:
         existing_state, _, _, _ = await get_state(chat_id)
         if existing_state is None:
-            if AD_COMMENT_TRIGGER_WORD not in ad_comment_text.lower():
-                log.info(
-                    f"🔕 {chat_id}: комментарий без слова "
-                    f"'{AD_COMMENT_TRIGGER_WORD}' ({ad_comment_text[:80]!r}), игнорируем"
-                )
+            # По ТЗ: комментарий из одних эмодзи — не отвечаем вообще, ни
+            # благодарностью, ни приглашением, молча игнорируем.
+            if is_emoji_only_comment(ad_comment_text):
+                log.info(f"🔕 {chat_id}: комментарий из эмодзи ({ad_comment_text[:40]!r}), не отвечаем")
                 return web.Response(text="ok")
-            opener = random.choice(AD_COMMENT_OPENERS)
-            await send_wazzup(chat_id, opener)
+
+            if AD_COMMENT_TRIGGER_WORD in ad_comment_text.lower():
+                # Сценарий 2: комментарий со словом "хочу" — фиксированный
+                # маркетинговый шаблон-приветствие (3 варианта).
+                opener = random.choice(AD_COMMENT_OPENERS)
+                await send_wazzup(chat_id, opener)
+                history = [
+                    {"role": "user", "content": ad_comment_text},
+                    {"role": "assistant", "content": opener},
+                ]
+                await set_state(chat_id, STATE_ACTIVE, history=history)
+                await start_reminder_chain(chat_id)
+                asyncio.create_task(log_message(chat_id, "user", ad_comment_text))
+                asyncio.create_task(log_message(chat_id, "assistant", opener))
+                log.info(f"🎯 {chat_id}: ответила на рекламный комментарий 'хочу' фиксированным приветствием")
+                if should_notify(chat_id):
+                    asyncio.create_task(notify_manager(chat_id, chat_id))
+                return web.Response(text="ok")
+
+            # Сценарий 1: обычный комментарий с текстом (вопрос или похвала,
+            # без слова "хочу") — отвечаем сгенерированным короткой репликой.
+            reply = await generate_comment_reply(ad_comment_text)
+            await send_wazzup(chat_id, reply)
             history = [
                 {"role": "user", "content": ad_comment_text},
-                {"role": "assistant", "content": opener},
+                {"role": "assistant", "content": reply},
             ]
             await set_state(chat_id, STATE_ACTIVE, history=history)
             await start_reminder_chain(chat_id)
             asyncio.create_task(log_message(chat_id, "user", ad_comment_text))
-            asyncio.create_task(log_message(chat_id, "assistant", opener))
-            log.info(f"🎯 {chat_id}: ответила на рекламный комментарий 'хочу' фиксированным приветствием")
+            asyncio.create_task(log_message(chat_id, "assistant", reply))
+            log.info(f"💬 {chat_id}: ответила на обычный комментарий под постом ({ad_comment_text[:60]!r})")
             if should_notify(chat_id):
                 asyncio.create_task(notify_manager(chat_id, chat_id))
             return web.Response(text="ok")
@@ -1653,11 +1912,19 @@ async def start_background_tasks(app: web.Application) -> None:
 
 
 # ---------- App factory ----------
+async def dogovor_page_handler(request: web.Request) -> web.Response:
+    path = os.path.join(os.path.dirname(__file__), "static", "dogovor.html")
+    with open(path, encoding="utf-8") as f:
+        return web.Response(text=f.read(), content_type="text/html")
+
+
 def create_app() -> web.Application:
     app = web.Application()
     app.router.add_post("/envy_hook", envy_hook_handler)
     app.router.add_post("/wazzup",    lambda r: web.Response(text="ok"))
     app.router.add_get("/health",     health_handler)
+    app.router.add_get("/dogovor",    dogovor_page_handler)
+    app.router.add_static("/static/", path=os.path.join(os.path.dirname(__file__), "static"), name="static")
     app.on_startup.append(init_http_session)
     app.on_startup.append(init_db)
     app.on_startup.append(init_scheduler)
