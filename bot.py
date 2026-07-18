@@ -34,6 +34,7 @@ from config import (
 )
 from prompt import SYSTEM_PROMPT
 import sheets_sync
+import sales_analysis
 
 # ---------- Менеджеры EnvyCRM (shkolaobucheniya.envycrm.com) ----------
 REAL_MANAGERS: list[int] = [
@@ -261,7 +262,11 @@ def is_emoji_only_comment(text: str) -> bool:
 async def generate_comment_reply(comment_text: str) -> str:
     """Генерирует ответ в директ на обычный комментарий под постом (Сценарий 1,
     не 'хочу' и не розыгрыш). Короткий, дружелюбный, экспертный, мотивирует
-    продолжить общение — без цен/форматов/дат, это только первый контакт."""
+    продолжить общение — без цен/форматов/дат, это только первый контакт.
+    Возвращает специальное значение "SKIP", если отвечать не стоит (грубость,
+    оскорбление, явный спам/нерелевантный текст, не имеющий отношения к школе
+    или фитнесу) — вызывающий код должен молча пропустить такой комментарий,
+    как и комментарий из одних эмодзи."""
     try:
         client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
         msg = await client.messages.create(
@@ -272,7 +277,13 @@ async def generate_comment_reply(comment_text: str) -> str:
                 "Ты — Луна, помощник Champion School (школа подготовки фитнес-тренеров "
                 "в Казахстане). Клиент оставил комментарий под постом школы в Instagram, "
                 "тебе нужно ответить ему личным сообщением в директ.\n\n"
-                "Правила:\n"
+                "СНАЧАЛА проверь тип комментария:\n"
+                "— Если комментарий грубый, оскорбительный, агрессивный, откровенный "
+                "спам/реклама чего-то постороннего, или вообще не имеет смысла/отношения "
+                "к школе и фитнесу — ответь ровно одним словом: SKIP (без кавычек, без "
+                "пояснений, ничего больше). Не пытайся вежливо отвечать на грубость.\n"
+                "— Во всех остальных случаях — правила ниже.\n\n"
+                "Правила для обычного ответа:\n"
                 "— Если в комментарии есть реальный вопрос — коротко и по-дружески "
                 "ответь по существу, затем ненавязчиво спроси, интересно ли узнать "
                 "подробнее об обучении в школе.\n"
@@ -288,6 +299,8 @@ async def generate_comment_reply(comment_text: str) -> str:
             messages=[{"role": "user", "content": comment_text}],
         )
         reply = msg.content[0].text.strip()
+        if reply.upper().startswith("SKIP"):
+            return "SKIP"
         return reply or "Спасибо за комментарий! 😊 Хотите узнать подробнее про обучение в нашей школе?"
     except Exception as e:
         log.error(f"❌ generate_comment_reply error: {e}")
@@ -348,14 +361,14 @@ def get_lock(chat_id: str) -> asyncio.Lock:
 
 
 # ---------- DB ----------
-async def log_message(chat_id: str, role: str, text: str | None) -> None:
+async def log_message(chat_id: str, role: str, text: str | None, manager_name: str | None = None) -> None:
     if not text:
         return
     try:
         async with db_pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO message_log (chat_id, role, text) VALUES ($1, $2, $3)",
-                chat_id, role, text,
+                "INSERT INTO message_log (chat_id, role, text, manager_name) VALUES ($1, $2, $3, $4)",
+                chat_id, role, text, manager_name,
             )
     except Exception as e:
         log.error(f"❌ log_message error {chat_id}: {e}")
@@ -799,6 +812,19 @@ async def lead_to_inbox(lead_id: int, chat_id: str, known_deal_id: int | None = 
         if not deal_id:
             log.warning(f"⚠️ lead_to_inbox: нет deal_id для lead_id={lead_id}")
             return
+
+        # ВАЖНО: перенос на этап "Чат-бот" привязан именно к МОМЕНТУ, когда
+        # deal_id становится известен — а не к моменту, когда Луна отправляет
+        # ответ. Раньше было наоборот, и это не срабатывало почти никогда:
+        # deal_id резолвится в CRM асинхронно, обычно на 2-5 секунд ПОЗЖЕ,
+        # чем уходит самый первый ответ Луны, поэтому в момент отправки
+        # ответа deal_id ещё не существовал. А дальше в диалоге либо шли
+        # только напоминания (специально не двигают этап), либо чат забирал
+        # живой менеджер — то есть Луна больше не отвечала, и второго шанса
+        # вызвать перенос не было. lead_to_inbox() вызывается ТОЛЬКО после
+        # того, как Луна уже реально ответила клиенту (см. notify_manager()),
+        # так что это подходящее и единственное надёжное место для переноса.
+        asyncio.create_task(move_deal_to_chatbot_stage(deal_id))
 
         url2 = f"{ENVY_CRM_URL}/openapi/v1/deal/toInbox?api_key={ENVY_API_KEY}"
         async with http_session.post(url2, json={"deal_id": deal_id}, headers=headers) as resp:
@@ -1576,6 +1602,8 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
                     # Прямая запись в БД без ожидания общего лока решает эту гонку.
                     await set_state(chat_id, STATE_MANAGER)
                     await clear_awaiting_reply(chat_id)
+                    manager_name = from_user.get("name") or f"employee_{crm_employee_id}"
+                    asyncio.create_task(log_message(chat_id, "manager", message_text, manager_name=manager_name))
                     is_handoff = mentions_whatsapp(message_text) and await classify_whatsapp_mention(message_text)
                     if is_handoff:
                         cancel_reminder_chain(chat_id)
@@ -1682,7 +1710,16 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
                     {"role": "assistant", "content": opener},
                 ]
                 await set_state(chat_id, STATE_ACTIVE, history=history)
-                await start_reminder_chain(chat_id)
+                # НЕ запускаем цепочку напоминаний здесь: клиент пока только
+                # оставил комментарий, а не написал в директ сам. По правилам
+                # Meta ответ на комментарий (Private Reply) — это разовое
+                # исключение из 24-часового окна, разрешено ОДНО такое
+                # сообщение. Любые следующие автоматические сообщения без
+                # ответа клиента Instagram просто не доставит. Цепочка
+                # стартует сама по себе позже, когда клиент реально напишет
+                # в директ — это уже обычный `message`, не ad-комментарий, и
+                # обрабатывается основным потоком ниже, где start_reminder_chain
+                # уже вызывается штатно.
                 asyncio.create_task(log_message(chat_id, "user", ad_comment_text))
                 asyncio.create_task(log_message(chat_id, "assistant", opener))
                 log.info(f"🎯 {chat_id}: ответила на рекламный комментарий 'хочу' фиксированным приветствием")
@@ -1693,13 +1730,18 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
             # Сценарий 1: обычный комментарий с текстом (вопрос или похвала,
             # без слова "хочу") — отвечаем сгенерированным короткой репликой.
             reply = await generate_comment_reply(ad_comment_text)
+            if reply == "SKIP":
+                log.info(f"🔕 {chat_id}: комментарий грубый/нерелевантный ({ad_comment_text[:60]!r}), не отвечаем")
+                return web.Response(text="ok")
             await send_wazzup(chat_id, reply)
             history = [
                 {"role": "user", "content": ad_comment_text},
                 {"role": "assistant", "content": reply},
             ]
             await set_state(chat_id, STATE_ACTIVE, history=history)
-            await start_reminder_chain(chat_id)
+            # См. комментарий выше в Сценарии 2 — по той же причине (правило
+            # Meta об одном разрешённом сообщении на комментарий) цепочку
+            # напоминаний здесь не запускаем.
             asyncio.create_task(log_message(chat_id, "user", ad_comment_text))
             asyncio.create_task(log_message(chat_id, "assistant", reply))
             log.info(f"💬 {chat_id}: ответила на обычный комментарий под постом ({ad_comment_text[:60]!r})")
@@ -1754,7 +1796,19 @@ async def init_db(app: web.Application) -> None:
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
+        await conn.execute("ALTER TABLE message_log ADD COLUMN IF NOT EXISTS manager_name TEXT")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_message_log_created_at ON message_log (created_at)")
+        # Разбор качества продаж по диалогам, которые вёл живой менеджер (не Луна).
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS dialog_analysis (
+                id           BIGSERIAL PRIMARY KEY,
+                chat_id      TEXT NOT NULL,
+                manager_name TEXT,
+                analysis     JSONB NOT NULL,
+                created_at   TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_dialog_analysis_created_at ON dialog_analysis (created_at)")
     log.info("✅ DB готова")
 
 
@@ -1839,6 +1893,20 @@ async def build_and_send_daily_report() -> None:
         log.error(f"❌ build_and_send_daily_report error: {e}")
 
 
+async def build_and_send_sales_analysis_report() -> None:
+    """Ежедневный разбор диалогов, которые вели живые менеджеры — по чек-листу
+    продаж через Claude. См. sales_analysis.py."""
+    try:
+        summary = await sales_analysis.run_daily_sales_analysis(db_pool, ANTHROPIC_API_KEY)
+        if summary:
+            await send_whatsapp_to_manager(summary)
+            log.info("📈 Разбор диалогов менеджеров отправлен Артёму")
+        else:
+            log.info("📈 Разбор диалогов менеджеров: за сутки менеджеры не подключались, отчёт не шлём")
+    except Exception as e:
+        log.error(f"❌ build_and_send_sales_analysis_report error: {e}")
+
+
 # ---------- Scheduler init ----------
 async def init_scheduler(app: web.Application) -> None:
     global scheduler
@@ -1871,6 +1939,17 @@ async def init_scheduler(app: web.Application) -> None:
         build_and_send_daily_report,
         CronTrigger(hour=6, minute=0),
         id="daily_report",
+        replace_existing=True,
+    )
+
+    # Разбор диалогов менеджеров — сразу после конца смены менеджеров (20:00
+    # Астана = 15:00 UTC), с небольшим запасом, чтобы не пересекаться по
+    # времени с другими задачами. Отдельно от daily_report (тот — про Луну и
+    # клиентов, этот — про качество работы живых менеджеров).
+    scheduler.add_job(
+        build_and_send_sales_analysis_report,
+        CronTrigger(hour=15, minute=30),
+        id="sales_analysis_report",
         replace_existing=True,
     )
 
