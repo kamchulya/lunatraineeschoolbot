@@ -203,6 +203,30 @@ AD_COMMENT_OPENERS = [
     "Подскажите, Вас интересует фитнес-тренер или тренер групповых программ?",
 ]
 
+# Сценарий 3: комментарий со словом "условия" под постом с розыгрышем —
+# отдельный фиксированный маркетинговый текст (утверждён Артёмом), отправляем
+# ВЕРБАТИМ, без перефразирования моделью — там конкретные даты и цифры призов,
+# ошибаться нельзя. НЕ путать с обычным вопросом "какие условия обучения" в
+# середине содержательного диалога — там это обрабатывает основной промпт
+# (prompt.py), эта фиксированная реплика — только для комментариев к постам.
+AD_COMMENT_CONDITIONS_TRIGGER_WORD = "услови"  # ловит "условия"/"условие"/"условиях" и т.п.
+
+AD_COMMENT_CONDITIONS_TEXT = (
+    "🎁 Условия розыгрыша\n\n"
+    "В первых числах августа (до 10 августа) мы проведём прямой эфир, где разыграем "
+    "7 призов:\n\n"
+    "🏆 3 приза — обучение в Champion Fitness School (онлайн или офлайн — в "
+    "зависимости от места вашего проживания).\n\n"
+    "💪 2 приза — абонементы в тренажёрный зал (если вы не из Астаны — подберём для "
+    "вас обучение).\n\n"
+    "🥤 1 приз — сертификат на спортивное питание.\n\n"
+    "🔥 1 самый интересный приз — «свидание» с нашим топ-тренером и лектором "
+    "Алмазом Кайратовичем, то есть полноценная персональная тренировка вместе с ним "
+    "(если вы из другого города — индивидуальная консультация).\n\n"
+    "Следите за нашими публикациями — совсем скоро сообщим точную дату и время прямого "
+    "эфира. Желаем удачи! 🍀"
+)
+
 
 def detect_ad_comment_text(payload: dict) -> str | None:
     """Вытаскивает текст исходного комментария из вебхука Wazzup, если входящее
@@ -1707,6 +1731,24 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
             # благодарностью, ни приглашением, молча игнорируем.
             if is_emoji_only_comment(ad_comment_text):
                 log.info(f"🔕 {chat_id}: комментарий из эмодзи ({ad_comment_text[:40]!r}), не отвечаем")
+                return web.Response(text="ok")
+
+            if AD_COMMENT_CONDITIONS_TRIGGER_WORD in ad_comment_text.lower():
+                # Сценарий 3: комментарий со словом "условия" (под постом с
+                # розыгрышем) — фиксированный текст с условиями розыгрыша,
+                # отправляем как есть, без участия модели.
+                await send_wazzup(chat_id, AD_COMMENT_CONDITIONS_TEXT)
+                history = [
+                    {"role": "user", "content": ad_comment_text},
+                    {"role": "assistant", "content": AD_COMMENT_CONDITIONS_TEXT},
+                ]
+                await set_state(chat_id, STATE_ACTIVE, history=history)
+                # Та же логика по напоминаниям, что и в Сценарии 2 — см. ниже.
+                asyncio.create_task(log_message(chat_id, "user", ad_comment_text))
+                asyncio.create_task(log_message(chat_id, "assistant", AD_COMMENT_CONDITIONS_TEXT))
+                log.info(f"🎁 {chat_id}: ответила условиями розыгрыша")
+                if should_notify(chat_id):
+                    asyncio.create_task(notify_manager(chat_id, chat_id))
                 return web.Response(text="ok")
 
             if AD_COMMENT_TRIGGER_WORD in ad_comment_text.lower():
