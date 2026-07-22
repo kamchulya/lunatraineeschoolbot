@@ -755,6 +755,18 @@ ENVY_CHATBOT_STAGE_BY_PIPELINE = {
     ENVY_PIPELINE_FITNESS: ENVY_STAGE_CHATBOT_FITNESS,
 }
 
+# Дедуп переноса на этап "Чат-бот" — по логам 20-22.07 выяснилось, что EnvyCRM
+# НЕ идемпотентен для updateDealStage: первый вызов для сделки даёт 200, а
+# КАЖДЫЙ повторный вызов для сделки, уже стоящей на этом этапе, падает 400.
+# move_deal_to_chatbot_stage() вызывается почти на каждой реплике бота в
+# диалоге (5 разных мест в коде) — без дедупа это давало лавину ложных 400 в
+# логах на один и тот же deal_id. Простое in-memory множество, по тому же
+# паттерну, что whatsapp_escalated/payment_notified ниже по файлу. Минус —
+# обнуляется при рестарте Railway (тогда один лишний 400 на уже перенесённую
+# сделку возможен один раз после рестарта) — сознательно выбран самый простой
+# вариант, не колонка в БД.
+chatbot_stage_moved: set[int] = set()
+
 
 async def update_deal_stage(deal_id: int, stage_id: int) -> bool:
     """Переводит сделку на указанный этап воронки через /deal/updateDealStage
@@ -764,12 +776,13 @@ async def update_deal_stage(deal_id: int, stage_id: int) -> bool:
         headers = {"Content-Type": "application/json"}
         url = f"{ENVY_CRM_URL}/openapi/v1/deal/updateDealStage?api_key={ENVY_API_KEY}"
         body = {"deal_id": deal_id, "stage_id": stage_id}
-        async with http_session.post(url, json=body, headers=headers) as resp:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with http_session.post(url, json=body, headers=headers, timeout=timeout) as resp:
             result = await resp.text()
             log.info(f"🏷️ deal/updateDealStage deal_id={deal_id} stage_id={stage_id} [{resp.status}]: {result[:200]}")
             return resp.status == 200
     except Exception as e:
-        log.error(f"❌ update_deal_stage error deal_id={deal_id}: {e}")
+        log.error(f"❌ update_deal_stage error deal_id={deal_id}: {type(e).__name__}: {e}")
         return False
 
 
@@ -780,12 +793,15 @@ async def move_deal_to_chatbot_stage(deal_id: int) -> None:
     Обратного переноса при переходе в режим напоминаний быть не должно —
     вызывающий код просто не дёргает эту функцию из send_reminder_chain_step(),
     так что состояние "Чат-бот" само по себе никогда не откатывается отсюда.
-    Идемпотентно — повторный вызов для сделки, уже стоящей на этом этапе,
-    безопасен."""
+    Дедуп через chatbot_stage_moved — см. комментарий выше (CRM не идемпотентен
+    на практике, несмотря на более раннее предположение об обратном)."""
+    if deal_id in chatbot_stage_moved:
+        return
     try:
         headers = {"Content-Type": "application/json"}
         url_get = f"{ENVY_CRM_URL}/openapi/v1/deal/get?api_key={ENVY_API_KEY}"
-        async with http_session.post(url_get, json={"deal_id": deal_id}, headers=headers) as resp:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with http_session.post(url_get, json={"deal_id": deal_id}, headers=headers, timeout=timeout) as resp:
             data = await resp.json()
         pipeline_id = (data.get("result") or {}).get("pipeline_id")
 
@@ -797,9 +813,14 @@ async def move_deal_to_chatbot_stage(deal_id: int) -> None:
             )
             return
 
-        await update_deal_stage(deal_id, stage_id)
+        ok = await update_deal_stage(deal_id, stage_id)
+        if ok:
+            chatbot_stage_moved.add(deal_id)
+            if len(chatbot_stage_moved) > 10000:
+                chatbot_stage_moved.clear()
     except Exception as e:
-        log.error(f"❌ move_deal_to_chatbot_stage error deal_id={deal_id}: {e}")
+        log.error(f"❌ move_deal_to_chatbot_stage error deal_id={deal_id}: {type(e).__name__}: {e}")
+
 
 
 # ---------- EnvyCRM ----------
