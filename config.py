@@ -54,3 +54,9 @@ PORT         = int(os.getenv("PORT", "8080"))
 # Пауза бота по каналу (через env в Railway)
 BOT_PAUSED_INSTAGRAM = os.getenv("BOT_PAUSED_INSTAGRAM", "false").lower() == "true"
 BOT_PAUSED_WHATSAPP  = os.getenv("BOT_PAUSED_WHATSAPP",  "false").lower() == "true"
+
+# Автографик Луны: работает 20:00-11:00 по Астане (после живых менеджеров).
+# Kill switch — поставить "false" в Railway, чтобы временно отключить график
+# (например для отладки), не трогая код. Сами часы заданы в bot.py.
+LUNA_SCHEDULE_ENABLED = os.getenv("LUNA_SCHEDULE_ENABLED", "true").lower() == "true"
+
