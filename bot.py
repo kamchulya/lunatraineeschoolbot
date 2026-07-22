@@ -11,6 +11,8 @@ import io
 import aiohttp
 import asyncpg
 import anthropic
+from docx import Document
+from docx.shared import Pt
 from knowledge_base import KNOWLEDGE_BASE
 import openai
 from aiohttp import web
@@ -28,11 +30,17 @@ from config import (
     DATABASE_URL,
     PORT,
     BOT_PAUSED_INSTAGRAM,
+    BOT_PAUSED_WHATSAPP,
     LUNA_SCHEDULE_ENABLED,
     ARTYOM_WHATSAPP_PERSONAL,
     WAZZUP_WHATSAPP_CHANNEL_ID,
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_BASE_URL,
+    DEEPSEEK_MODEL,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
 )
-from prompt import SYSTEM_PROMPT
+from prompt import SYSTEM_PROMPT, WHATSAPP_PROMPT
 import sheets_sync
 import sales_analysis
 
@@ -292,9 +300,9 @@ async def generate_comment_reply(comment_text: str) -> str:
     или фитнесу) — вызывающий код должен молча пропустить такой комментарий,
     как и комментарий из одних эмодзи."""
     try:
-        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        client = anthropic.AsyncAnthropic(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
         msg = await client.messages.create(
-            model="claude-haiku-4-5",
+            model=DEEPSEEK_MODEL,
             max_tokens=200,
             temperature=0.3,
             system=(
@@ -501,16 +509,27 @@ async def save_deal_id(chat_id: str, deal_id: int) -> None:
 
 
 # ---------- Wazzup ----------
+def _wazzup_channel_and_id(chat_id: str) -> tuple[str, str, str]:
+    """По маркеру 'wapp-' в chat_id (проставляет EnvyCRM в contact.external_id
+    для WhatsApp-контактов, аналог 'inst-' для Instagram — см. envy_hook_handler)
+    выбирает канал/chatType для Wazzup API и отдаёт настоящий chat_id без
+    префикса. Паттерн взят из Лолы, где уже работает в проде."""
+    if chat_id.startswith("wapp-"):
+        return WAZZUP_WHATSAPP_CHANNEL_ID, "whatsapp", chat_id[5:]
+    return WAZZUP_INSTAGRAM_CHANNEL_ID, "instagram", chat_id
+
+
 async def send_wazzup(chat_id: str, text: str) -> None:
     url = "https://api.wazzup24.com/v3/message"
     headers = {
         "Authorization": f"Bearer {WAZZUP_API_KEY}",
         "Content-Type": "application/json",
     }
+    channel_id, chat_type, real_chat_id = _wazzup_channel_and_id(chat_id)
     body = {
-        "channelId": WAZZUP_INSTAGRAM_CHANNEL_ID,
-        "chatId": chat_id,
-        "chatType": "instagram",
+        "channelId": channel_id,
+        "chatId": real_chat_id,
+        "chatType": chat_type,
         "text": text,
     }
     delays = [0, 2, 4]
@@ -549,10 +568,11 @@ async def send_wazzup_file(chat_id: str, file_url: str, caption: str = "") -> No
         "Authorization": f"Bearer {WAZZUP_API_KEY}",
         "Content-Type": "application/json",
     }
+    channel_id, chat_type, real_chat_id = _wazzup_channel_and_id(chat_id)
     body = {
-        "channelId": WAZZUP_INSTAGRAM_CHANNEL_ID,
-        "chatId": chat_id,
-        "chatType": "instagram",
+        "channelId": channel_id,
+        "chatId": real_chat_id,
+        "chatType": chat_type,
         "contentUri": file_url,
     }
     if caption:
@@ -689,9 +709,9 @@ async def classify_reminder_response(text: str) -> str:
     При ошибке классификации безопасный дефолт — 'critical' (лучше ответить
     по существу, чем молча продолжить автоматическую рассылку)."""
     try:
-        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        client = anthropic.AsyncAnthropic(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
         msg = await client.messages.create(
-            model="claude-haiku-4-5",
+            model=DEEPSEEK_MODEL,
             max_tokens=10,
             temperature=0,
             system=(
@@ -928,9 +948,9 @@ async def extract_client_info(history: list) -> tuple[str | None, str | None]:
         for m in history[-20:]
     )
     try:
-        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        client = anthropic.AsyncAnthropic(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
         msg = await client.messages.create(
-            model="claude-haiku-4-5",
+            model=DEEPSEEK_MODEL,
             max_tokens=100,
             temperature=0,
             system=(
@@ -949,14 +969,27 @@ async def extract_client_info(history: list) -> tuple[str | None, str | None]:
         return None, None
 
 
+def build_client_link(chat_id: str) -> tuple[str, str]:
+    """Отдаёт (подпись_канала, ссылка) для уведомлений Артёму — учитывает,
+    что chat_id для WhatsApp хранится с префиксом 'wapp-' (см. send_wazzup)."""
+    if chat_id.startswith("wapp-"):
+        phone = chat_id[5:]
+        return f"WhatsApp: +{phone}", f"https://wa.me/{phone}"
+    return f"Instagram: @{chat_id}", f"https://instagram.com/{chat_id}"
+
+
 async def send_unknown_question_notification(chat_id: str, client_text: str, history: list) -> None:
     """Луна не знает ответа и пообещала клиенту связь с менеджером — уведомляем Артёма."""
     name, phone = await extract_client_info(history)
-    ig_link = f"https://instagram.com/{chat_id}"
+    if chat_id.startswith("wapp-"):
+        # На WhatsApp номер и так точно известен из chat_id — не полагаемся
+        # на то, что модель правильно вытащит его из текста диалога.
+        phone = chat_id[5:]
+    label, link = build_client_link(chat_id)
     lines = [
         "❓ Луна не смогла ответить — обещала связь с менеджером",
         "",
-        f"Instagram: @{chat_id} ({ig_link})",
+        f"{label} ({link})",
     ]
     if name:
         lines.append(f"Имя: {name}")
@@ -979,10 +1012,10 @@ async def send_whatsapp_escalation(chat_id: str, category: str, client_text: str
     if len(whatsapp_escalated) > 10000:
         whatsapp_escalated.clear()
 
-    ig_link = f"https://instagram.com/{chat_id}"
+    label, link = build_client_link(chat_id)
     text = (
         f"🙋 Луна: клиент требует вовлечения ({category})\n\n"
-        f"Instagram: @{chat_id} ({ig_link})\n"
+        f"{label} ({link})\n"
         f"Сообщение клиента: «{client_text[:300]}»"
     )
     await send_whatsapp_to_manager(text)
@@ -999,10 +1032,10 @@ async def send_payment_notification(chat_id: str, client_text: str) -> None:
     if len(payment_notified) > 10000:
         payment_notified.clear()
 
-    ig_link = f"https://instagram.com/{chat_id}"
+    label, link = build_client_link(chat_id)
     text = (
         f"💰 Луна: клиент утверждает, что оплатил(а) — нужна проверка!\n\n"
-        f"Instagram: @{chat_id} ({ig_link})\n"
+        f"{label} ({link})\n"
         f"Сообщение клиента: «{client_text[:300]}»\n\n"
         f"Проверьте поступление в Kaspi/CRM и подтвердите клиенту."
     )
@@ -1076,9 +1109,9 @@ async def classify_whatsapp_mention(text: str) -> bool:
     Instagram-тред закрыт, автоматические напоминания здесь больше не нужны.
     Возвращает True только во втором случае (handoff)."""
     try:
-        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        client = anthropic.AsyncAnthropic(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
         msg = await client.messages.create(
-            model="claude-haiku-4-5",
+            model=DEEPSEEK_MODEL,
             max_tokens=5,
             temperature=0,
             system=(
@@ -1169,9 +1202,9 @@ async def claude_reply(messages: list[dict], system_prompt: str | None = None, k
             "cache_control": {"type": "ephemeral"},
         })
 
-    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    client = anthropic.AsyncAnthropic(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
     msg = await client.messages.create(
-        model="claude-haiku-4-5",
+        model=DEEPSEEK_MODEL,
         max_tokens=1024,
         temperature=0.2,
         system=system_blocks,
@@ -1203,6 +1236,7 @@ async def handle_incoming(chat_id: str, text: str | None) -> None:
 
 
 async def _handle_incoming(chat_id: str, text: str | None) -> None:
+    base_prompt = WHATSAPP_PROMPT if chat_id.startswith("wapp-") else SYSTEM_PROMPT
     # Автографик Луны: 20:00-11:00 Астана. В окно 11:00-20:00 работают живые
     # менеджеры — бот молчит, но сообщение сохраняем в историю, чтобы контекст
     # не терялся к моменту, когда Луна снова включится.
@@ -1287,7 +1321,7 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
         else:
             history.append({"role": "user", "content": "Здравствуйте"})
         try:
-            reply = await claude_reply(history, SYSTEM_PROMPT, kb=kb)
+            reply = await claude_reply(history, base_prompt, kb=kb)
             if not reply or not reply.strip():
                 raise ValueError("пустой ответ")
         except Exception as e:
@@ -1403,7 +1437,7 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
             try:
                 soft_reply = await claude_reply(
                     history,
-                    SYSTEM_PROMPT + (
+                    base_prompt + (
                         "\n\nВАЖНО: клиент только что ответил расплывчато/отложенно на "
                         "автоматическое напоминание (например \"я подумаю\", \"ок\", "
                         "\"хорошо\"). Отреагируй коротко и тепло (1-2 предложения), без "
@@ -1445,7 +1479,7 @@ async def _handle_incoming(chat_id: str, text: str | None) -> None:
     history = history[-MAX_HISTORY:]
 
     try:
-        reply = await claude_reply(history, SYSTEM_PROMPT, kb=kb)
+        reply = await claude_reply(history, base_prompt, kb=kb)
         if not reply or not reply.strip():
             raise ValueError("пустой ответ")
     except Exception as e:
@@ -1498,9 +1532,10 @@ async def _answer_pending(chat_id: str) -> None:
 
     text = history[-1].get("content", "")
     kb = sheets_sync.get_cached_knowledge_base(fallback=KNOWLEDGE_BASE)
+    base_prompt = WHATSAPP_PROMPT if chat_id.startswith("wapp-") else SYSTEM_PROMPT
 
     try:
-        reply = await claude_reply(history, SYSTEM_PROMPT, kb=kb)
+        reply = await claude_reply(history, base_prompt, kb=kb)
         if not reply or not reply.strip():
             raise ValueError("пустой ответ")
     except Exception as e:
@@ -1575,12 +1610,19 @@ async def _debounced_handle_incoming(chat_id: str) -> None:
 
 
 async def envy_hook_handler(request: web.Request) -> web.Response:
-    if BOT_PAUSED_INSTAGRAM:
-        return web.Response(text="ok")
-
     try:
         payload = await request.json()
     except Exception:
+        return web.Response(text="ok")
+
+    # Канал определяем по integration.service — значение для WhatsApp пока не
+    # подтверждено документацией EnvyCRM, проверяем оба вероятных варианта
+    # ("whatsapp" и "wapi", по аналогии с Лолой). Сверить после первого
+    # реального сообщения через WhatsApp-канал и поправить при необходимости.
+    is_whatsapp_service = payload.get("integration", {}).get("service") in ("whatsapp", "wapi")
+    if is_whatsapp_service and BOT_PAUSED_WHATSAPP:
+        return web.Response(text="ok")
+    if not is_whatsapp_service and BOT_PAUSED_INSTAGRAM:
         return web.Response(text="ok")
 
     log.info(f"📨 envy_hook: {json.dumps(payload, ensure_ascii=False)[:1000]}")
@@ -1722,8 +1764,10 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
 
     # ---------- Таргет-реклама / комментарии под постами ----------
     # Применяем только к новым диалогам (ещё нет state в БД) — чтобы случайно
-    # не перехватить обработку у уже идущего разговора.
-    ad_comment_text = detect_ad_comment_text(payload)
+    # не перехватить обработку у уже идущего разговора. Сценарий целиком
+    # Instagram-специфичный (комментарии под постами) — на WhatsApp такого
+    # нет в принципе, там реклама приходит обычным первым сообщением.
+    ad_comment_text = detect_ad_comment_text(payload) if not chat_id.startswith("wapp-") else None
     if ad_comment_text is not None:
         existing_state, _, _, _ = await get_state(chat_id)
         if existing_state is None:
@@ -1886,9 +1930,9 @@ async def summarize_top_questions(texts: list[str]) -> str:
         return "— нет данных —"
     joined = "\n".join(f"- {t}" for t in texts)
     try:
-        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        client = anthropic.AsyncAnthropic(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
         msg = await client.messages.create(
-            model="claude-haiku-4-5",
+            model=DEEPSEEK_MODEL,
             max_tokens=400,
             temperature=0.2,
             system=(
@@ -1942,6 +1986,127 @@ async def build_and_send_daily_report() -> None:
         log.info("📊 Отчёт за смену отправлен Артёму")
     except Exception as e:
         log.error(f"❌ build_and_send_daily_report error: {e}")
+
+
+# ---------- Ежедневная выгрузка всех диалогов в Telegram (9:00 Астана) ----------
+def _export_role_label(role: str, manager_name: str | None) -> str:
+    if role == "user":
+        return "Клиент"
+    if role == "assistant":
+        return "Луна"
+    if role == "manager":
+        return f"Менеджер {manager_name}" if manager_name else "Менеджер"
+    return role
+
+
+async def build_dialogues_docx(since: datetime, until: datetime, label_date: str) -> tuple[str, str] | None:
+    """Собирает .docx со всеми диалогами за период since..until (границы —
+    календарные сутки по Астане, см. build_and_send_dialogues_export),
+    сгруппированными по каналу (WhatsApp/Instagram определяем по префиксу
+    'wapp-' в chat_id, как и везде в коде) и внутри канала — по chat_id, в
+    хронологии. Формат — по образцу выгрузки Лолы (см.
+    dialogues_2026-07-21.docx): просто дамп реплик, без анализа/статистики.
+    label_date — дата экспортируемых суток (для имени файла), не сегодняшняя.
+    Возвращает (путь_к_файлу, имя_файла) или None, если сообщений не было."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT chat_id, role, text, manager_name, created_at FROM message_log "
+            "WHERE created_at >= $1 AND created_at < $2 ORDER BY chat_id, created_at ASC",
+            since, until,
+        )
+    if not rows:
+        return None
+
+    by_chat: dict[str, list] = {}
+    for r in rows:
+        by_chat.setdefault(r["chat_id"], []).append(r)
+
+    # Порядок чатов внутри канала — по времени первого сообщения за период,
+    # как читается в примере Лолы (не алфавитный).
+    ordered_chat_ids = sorted(by_chat.keys(), key=lambda cid: by_chat[cid][0]["created_at"])
+    whatsapp_ids = [cid for cid in ordered_chat_ids if cid.startswith("wapp-")]
+    instagram_ids = [cid for cid in ordered_chat_ids if not cid.startswith("wapp-")]
+
+    doc = Document()
+    style = doc.styles["Normal"]
+    style.font.size = Pt(10)
+
+    def add_channel_section(title: str, chat_ids: list[str]) -> None:
+        if not chat_ids:
+            return
+        doc.add_heading(title, level=1)
+        for cid in chat_ids:
+            display_id = cid[5:] if cid.startswith("wapp-") else cid
+            doc.add_heading(display_id, level=2)
+            for r in by_chat[cid]:
+                local_time = r["created_at"].astimezone(ASTANA_TZ).strftime("%H:%M")
+                label = _export_role_label(r["role"], r["manager_name"])
+                p = doc.add_paragraph()
+                run = p.add_run(f"[{local_time}] {label}: ")
+                run.bold = True
+                p.add_run(r["text"] or "")
+
+    add_channel_section("WhatsApp", whatsapp_ids)
+    add_channel_section("Instagram", instagram_ids)
+
+    filename = f"dialogues_{label_date}.docx"
+    path = f"/tmp/{filename}"
+    doc.save(path)
+    return path, filename
+
+
+async def send_telegram_document(chat_id: str, file_path: str, filename: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not chat_id:
+        log.warning("⚠️ TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не заданы — выгрузка не отправлена")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    delays = [0, 2, 4]
+    for attempt, delay in enumerate(delays):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            with open(file_path, "rb") as f:
+                form = aiohttp.FormData()
+                form.add_field("chat_id", str(chat_id))
+                form.add_field("document", f, filename=filename,
+                                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                async with http_session.post(url, data=form) as resp:
+                    result = await resp.text()
+                    log.info(f"📤 Telegram sendDocument attempt={attempt+1} [{resp.status}]: {result[:200]}")
+                    if resp.status == 200:
+                        return True
+        except Exception as e:
+            log.warning(f"⚠️ Telegram sendDocument attempt {attempt+1} error: {e}")
+    log.error("❌ Telegram sendDocument: все 3 попытки провалились")
+    return False
+
+
+async def build_and_send_dialogues_export() -> None:
+    """Ежедневная выгрузка ВСЕХ диалогов (без фильтра, оба канала) за последние
+    сутки — отдельно от аналитических отчётов Артёму, чисто сырой архив
+    переписок для Камшат в Telegram. См. build_dialogues_docx()."""
+    try:
+        now_astana = datetime.now(ASTANA_TZ)
+        today_start_astana = now_astana.replace(hour=0, minute=0, second=0, microsecond=0)
+        yesterday_start_astana = today_start_astana - timedelta(days=1)
+        since = yesterday_start_astana.astimezone(timezone.utc)
+        until = today_start_astana.astimezone(timezone.utc)
+        label_date = yesterday_start_astana.strftime("%Y-%m-%d")
+
+        result = await build_dialogues_docx(since, until, label_date)
+        if result is None:
+            log.info(f"📁 Выгрузка диалогов за {label_date}: сообщений не было, файл не шлём")
+            return
+        path, filename = result
+        ok = await send_telegram_document(TELEGRAM_CHAT_ID, path, filename)
+        if ok:
+            log.info(f"📁 Выгрузка диалогов отправлена в Telegram: {filename}")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    except Exception as e:
+        log.error(f"❌ build_and_send_dialogues_export error: {e}")
 
 
 async def build_and_send_sales_analysis_report() -> None:
@@ -2001,6 +2166,16 @@ async def init_scheduler(app: web.Application) -> None:
         build_and_send_sales_analysis_report,
         CronTrigger(hour=15, minute=30),
         id="sales_analysis_report",
+        replace_existing=True,
+    )
+
+    # Ежедневная выгрузка ВСЕХ диалогов (WhatsApp+Instagram, без фильтра) в
+    # Telegram Камшат — 9:00 Астана (UTC+5) = 04:00 UTC. Отдельно от
+    # аналитических отчётов Артёму — просто сырой архив переписок за сутки.
+    scheduler.add_job(
+        build_and_send_dialogues_export,
+        CronTrigger(hour=4, minute=0),
+        id="dialogues_export",
         replace_existing=True,
     )
 

@@ -110,7 +110,6 @@ async def analyze_dialog(anthropic_api_key: str, chat_id: str, transcript: str) 
         msg = await client.messages.create(
             model="claude-sonnet-5",
             max_tokens=800,
-            temperature=0.2,
             system=SALES_ANALYSIS_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": transcript[:15000]}],
         )
