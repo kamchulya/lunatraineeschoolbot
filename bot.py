@@ -409,7 +409,7 @@ async def handle_reminder_oprosnik(chat_id: str, text: str, history: list) -> st
     # АКТИВНЫЕ — "Что дальше?"
     elif client_type == ACTIVE:
         responses = {
-            "1": "Вот две ссылки:\n\nФитнес-тренер: https://champion-school.skillspace.ru/l/fitness-instruktor-s-nula\n\nГрупповые программы: https://champion-school.skillspace.ru/l/groupprograms\n\nЗайдите → выберите 'Демо доступ' → введите ФИ. Я активирую доступ! 🎯",
+            "1": "Вот две ссылки:\n\nФитнес-тренер: https://champion-school.skillspace.ru/l/fitness-instruktor-s-nula\n\nГрупповые программы: https://champion-school.skillspace.ru/l/yoga-stretching-oda\n\nЗайдите → выберите 'Демо доступ' → введите ФИ. Я активирую доступ! 🎯",
             "2": "Онлайн: от 99,900 тг (3 месяца). Рассрочка Kaspi 0-0-12: ~5-8 тыс/месяц. Офлайн немного дороже, но интенсивнее. Рассчитаю точную цену под вас 💰",
             "3": "Нет проблем! Онлайн: учитесь 24/7, в своём темпе. Офлайн: выходные (сб-вс) или будни (вт-чт). Можно даже совмещать. Расскажу подробнее 📅",
             "4": "Вот отзывы выпускников: https://www.instagram.com/reel/DW6WaodCI32/\n\nИ видео школы: https://www.instagram.com/reel/DI3_-a3I4zA/\n\nПосмотрите, почувствуйте уровень 🎓",
