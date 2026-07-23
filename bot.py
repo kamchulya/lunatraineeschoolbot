@@ -2024,6 +2024,8 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
         chat_id_check = str(contact_check.get("external_id") or "").strip()
         if chat_id_check.startswith("inst-"):
             chat_id_check = chat_id_check[5:]
+        elif is_whatsapp_service and not chat_id_check.startswith("wapp-"):
+            chat_id_check = "wapp-" + chat_id_check
 
         # Lesson 10: вложение без подписи — не игнорируем, пишем что получили
         if not message_text and chat_id_check:
@@ -2093,6 +2095,8 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
     chat_id = str(contact.get("external_id") or "").strip()
     if chat_id.startswith("inst-"):
         chat_id = chat_id[5:]
+    elif is_whatsapp_service and not chat_id.startswith("wapp-"):
+        chat_id = "wapp-" + chat_id
     if not chat_id:
         return web.Response(text="ok")
 
