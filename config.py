@@ -13,8 +13,7 @@ WAZZUP_INSTAGRAM_CHANNEL_ID = "1e7bbcd8-62d2-459d-a863-06f4f5bf2860"
 # Эскалация триггерных тем (перенос/возврат/оплата/сертификат) — направляем клиента
 # на личный WhatsApp Артёма, пока не построен отдельный WhatsApp-бот школы.
 ARTYOM_WHATSAPP_PERSONAL = "+77713974199"
-# Рабочий WABA-номер, привязанный к CRM/Wazzup — задел на будущее, когда появится
-# полноценный WhatsApp-бот школы (по аналогии с Лолой). Пока не используется в коде.
+# Рабочий WABA-номер, привязанный к CRM/Wazzup — это для полноценной интеграции.
 ARTYOM_WHATSAPP_WABA = "+77471494815"
 # Wazzup channelId активного WhatsApp-канала (+77471494815, transport=wapi, state=active).
 # Через него бот шлёт Артёму уведомления напрямую в WhatsApp.
@@ -29,17 +28,23 @@ ENVY_FORWARD_URL  = os.getenv("ENVY_FORWARD_URL",   "")
 ENVY_OPERATOR_KEY = os.getenv("ENVY_OPERATOR_KEY",  "")
 ENVY_FUNNEL_NAME  = os.getenv("ENVY_FUNNEL_NAME",   "Входящие")
 
-# OpenAI (запасной провайдер, gpt-5-mini на казахском)
+# OpenAI (для эмбеддингов RAG)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# DeepSeek (основной провайдер для Луны)
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+# DeepSeek (через Anthropic-совместимый эндпоинт — тот же SDK anthropic,
+# просто другой base_url и ключ). Используется вместо Haiku во всех местах,
+# где раньше был claude-haiku-4-5 (основной диалог + классификаторы).
+DEEPSEEK_API_KEY  = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
+DEEPSEEK_MODEL    = "deepseek-v4-flash"
 
 # Google Sheets (синхронизация базы знаний)
 # GOOGLE_CREDENTIALS_JSON — весь JSON сервисного аккаунта одной строкой (Railway env var)
 SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID", "13zyjRX1e_Z3x92PUWLKoMynGMFBWzvZS9oPNm7XRQ_Y")
+
+# Telegram (ежедневная выгрузка всех диалогов в 9:00 Астана — Камшат)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "")
 
 # Railway / PostgreSQL
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -47,3 +52,10 @@ PORT         = int(os.getenv("PORT", "8080"))
 
 # Пауза бота по каналу (через env в Railway)
 BOT_PAUSED_INSTAGRAM = os.getenv("BOT_PAUSED_INSTAGRAM", "false").lower() == "true"
+BOT_PAUSED_WHATSAPP  = os.getenv("BOT_PAUSED_WHATSAPP",  "false").lower() == "true"
+
+# Автографик Луны: работает 20:00-11:00 по Астане (после живых менеджеров).
+# Kill switch — поставить "false" в Railway, чтобы временно отключить график
+# (например для отладки), не трогая код. Сами часы заданы в bot.py.
+LUNA_SCHEDULE_ENABLED = os.getenv("LUNA_SCHEDULE_ENABLED", "true").lower() == "true"
+

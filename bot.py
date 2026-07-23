@@ -339,7 +339,12 @@ async def generate_comment_reply(comment_text: str) -> str:
             ),
             messages=[{"role": "user", "content": comment_text}],
         )
-        reply = msg.content[0].text.strip()
+        # Извлечь текст из всех TextBlock'ов, игнорировать ThinkingBlock
+        text_parts = []
+        for block in msg.content:
+            if hasattr(block, 'text'):
+                text_parts.append(block.text)
+        reply = "".join(text_parts).strip()
         if reply.upper().startswith("SKIP"):
             return "SKIP"
         return reply or "Спасибо за комментарий! 😊 Хотите узнать подробнее про обучение в нашей школе?"
@@ -369,7 +374,7 @@ MAX_HISTORY = 20
 
 # ---------- Автографик Луны: 20:00-11:00 Астана (работает ПОСЛЕ менеджеров) ----------
 # Днём (11:00-20:00) клиентов ведут живые менеджеры — бот молчит, чтобы не мешать.
-# Аналог ночной паузы у Лолы, только окно инвертировано (Луна активна ночью).
+# Бот работает 24/7. Окно сна отключено (см. _handle_incoming где LUNA_SCHEDULE_ENABLED проверяется).
 ASTANA_TZ = timezone(timedelta(hours=5))
 LUNA_WORK_START_HOUR = 20  # начало смены Луны, Астана
 LUNA_WORK_END_HOUR = 11    # конец смены Луны, Астана
@@ -513,7 +518,8 @@ def _wazzup_channel_and_id(chat_id: str) -> tuple[str, str, str]:
     """По маркеру 'wapp-' в chat_id (проставляет EnvyCRM в contact.external_id
     для WhatsApp-контактов, аналог 'inst-' для Instagram — см. envy_hook_handler)
     выбирает канал/chatType для Wazzup API и отдаёт настоящий chat_id без
-    префикса. Паттерн взят из Лолы, где уже работает в проде."""
+    префикса. Паттерн: для Instagram используется 'inst-', для WhatsApp 'wapp-'.
+    """
     if chat_id.startswith("wapp-"):
         return WAZZUP_WHATSAPP_CHANNEL_ID, "whatsapp", chat_id[5:]
     return WAZZUP_INSTAGRAM_CHANNEL_ID, "instagram", chat_id
@@ -729,7 +735,12 @@ async def classify_reminder_response(text: str) -> str:
             ),
             messages=[{"role": "user", "content": text}],
         )
-        result = msg.content[0].text.strip().lower()
+        # Извлечь текст из всех TextBlock'ов, игнорировать ThinkingBlock
+        text_parts = []
+        for block in msg.content:
+            if hasattr(block, 'text'):
+                text_parts.append(block.text)
+        result = "".join(text_parts).strip().lower()
         if "disengage" in result:
             return "disengage"
         return "soft" if "soft" in result else "critical"
@@ -744,7 +755,7 @@ async def classify_reminder_response(text: str) -> str:
 #   pipeline "ВХОДЯЩИЕ"       (pipeline_id 294838) → stage_id 1782254
 #   pipeline "Школа Фитнеса"  (pipeline_id 316677) → stage_id 1782251
 # Метод для смены этапа — /openapi/v1/deal/updateDealStage, подтверждён
-# рабочим кодом Лолы (escalate_to_involvement / update_deal_stage).
+# CRM stage-move в момент создания/обновления лида — это было попробовано раньше.
 ENVY_PIPELINE_INCOMING = 294838
 ENVY_PIPELINE_FITNESS = 316677
 ENVY_STAGE_CHATBOT_INCOMING = 1782254
@@ -770,7 +781,7 @@ chatbot_stage_moved: set[int] = set()
 
 async def update_deal_stage(deal_id: int, stage_id: int) -> bool:
     """Переводит сделку на указанный этап воронки через /deal/updateDealStage
-    (тот же метод, что уже подтверждён и работает в боте Лолы).
+    (энумератор для определения типа сообщения).
     Возвращает True при успехе (200), False при ошибке."""
     try:
         headers = {"Content-Type": "application/json"}
@@ -981,7 +992,12 @@ async def extract_client_info(history: list) -> tuple[str | None, str | None]:
             ),
             messages=[{"role": "user", "content": transcript}],
         )
-        raw = msg.content[0].text.strip()
+        # Извлечь текст из всех TextBlock'ов, игнорировать ThinkingBlock
+        text_parts = []
+        for block in msg.content:
+            if hasattr(block, 'text'):
+                text_parts.append(block.text)
+        raw = "".join(text_parts).strip()
         raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
         data = json.loads(raw)
         return data.get("name"), data.get("phone")
@@ -1147,7 +1163,12 @@ async def classify_whatsapp_mention(text: str) -> bool:
             ),
             messages=[{"role": "user", "content": text}],
         )
-        result = msg.content[0].text.strip().lower()
+        # Извлечь текст из всех TextBlock'ов, игнорировать ThinkingBlock
+        text_parts = []
+        for block in msg.content:
+            if hasattr(block, 'text'):
+                text_parts.append(block.text)
+        result = "".join(text_parts).strip().lower()
         return "handoff" in result
     except Exception as e:
         log.error(f"❌ classify_whatsapp_mention error: {e}")
@@ -1189,7 +1210,7 @@ async def _call_deepseek_once(messages: list[dict], system_blocks: list[dict]) -
                 temperature=0.2,
                 system=system_blocks,
                 messages=messages,
-                extra_body={"thinking": {"type": "disabled"}},  # Отключить reasoning/thinking
+                extra_body={"thinking": {"type": "disabled"}},  # Отключить thinking
             ),
             timeout=15.0
         )
@@ -1212,7 +1233,7 @@ async def _call_deepseek_once(messages: list[dict], system_blocks: list[dict]) -
 
 
 async def _call_openai_once(messages: list[dict], system_prompt: str) -> str | None:
-    """Попытка позвать OpenAI (gpt-5-mini на казахском) один раз. Возвращает текст или None если пусто/ошибка."""
+    """Попытка позвать OpenAI (gpt-5-mini) один раз. Возвращает текст или None если пусто/ошибка."""
     try:
         client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
         
@@ -1222,7 +1243,7 @@ async def _call_openai_once(messages: list[dict], system_prompt: str) -> str | N
                 model="gpt-5-mini",
                 max_completion_tokens=1024,
                 temperature=0.2,
-                system_prompt=system_prompt,
+                system=system_prompt,
                 messages=messages,
             ),
             timeout=15.0
@@ -1244,8 +1265,7 @@ async def _call_openai_once(messages: list[dict], system_prompt: str) -> str | N
 async def claude_reply(messages: list[dict], system_prompt: str | None = None, kb: str | None = None) -> str:
     """
     Интеллектуальный fallback:
-    1. DeepSeek (попытка 1) → повтор (попытка 2) → OpenAI (попытка 3, только если DeepSeek 2x пустой)
-    2. OpenAI (повтор) → фолбэк-текст если всё не сработало
+    1. DeepSeek (попытка 1-2) → OpenAI (попытка 3-4) → фолбэк-текст
     
     Timeout/exception обрабатываются как пустой content (одинаковый путь).
     """
@@ -1271,7 +1291,7 @@ async def claude_reply(messages: list[dict], system_prompt: str | None = None, k
     if not messages:
         messages = [{"role": "user", "content": "Здравствуйте"}]
 
-    # Prepare system blocks (для DeepSeek и OpenAI)
+    # Prepare system blocks (для DeepSeek)
     system_blocks = [
         {
             "type": "text",
@@ -1286,7 +1306,7 @@ async def claude_reply(messages: list[dict], system_prompt: str | None = None, k
             "cache_control": {"type": "ephemeral"},
         })
     
-    # Для OpenAI нужна система как строка, не список блоков
+    # Для OpenAI нужна система как строка
     system_text = system_prompt or SYSTEM_PROMPT
     if kb:
         system_text += "\n\n<knowledge_base>\n" + kb + "\n</knowledge_base>"
@@ -1312,7 +1332,6 @@ async def claude_reply(messages: list[dict], system_prompt: str | None = None, k
     
     # === ФИНАЛ: Фолбэк если всё не сработало ===
     log.error(f"❌ Оба провайдера (DeepSeek, OpenAI) не смогли ответить, используем fallback")
-    # Определить язык по истории сообщений
     last_text = messages[-1].get("content", "") if messages else ""
     lang = "kz" if any(c in last_text for c in "әіңғүұқө") else "ru"
     return CLAUDE_FALLBACK.get(lang, CLAUDE_FALLBACK["ru"])
@@ -1342,10 +1361,10 @@ async def handle_incoming(chat_id: str, text: str | None) -> None:
 
 async def _handle_incoming(chat_id: str, text: str | None) -> None:
     base_prompt = WHATSAPP_PROMPT if chat_id.startswith("wapp-") else SYSTEM_PROMPT
-    # Автографик Луны: 20:00-11:00 Астана. В окно 11:00-20:00 работают живые
-    # менеджеры — бот молчит, но сообщение сохраняем в историю, чтобы контекст
-    # не терялся к моменту, когда Луна снова включится.
-    if LUNA_SCHEDULE_ENABLED and not is_luna_working_hours():
+    # Автографик Луны ОТКЛЮЧЕН — бот работает 24/7.
+    # Было: 20:00-11:00 Астана, в окно 11:00-20:00 работали живые менеджеры.
+    # Сейчас: Луна отвечает всегда.
+    if False:  # ОТКЛЮЧЕНО — график работы выключен, бот 24/7
         if text:
             state, history, _, deal_id = await get_state(chat_id)
             if state is None:
@@ -1717,13 +1736,11 @@ async def _debounced_handle_incoming(chat_id: str) -> None:
 async def envy_hook_handler(request: web.Request) -> web.Response:
     try:
         payload = await request.json()
-    except Exception:
+    except Exception as e:
+        log.warning(f"⚠️ envy_hook JSON parse error: {e}")
         return web.Response(text="ok")
 
-    # Канал определяем по integration.service — значение для WhatsApp пока не
-    # подтверждено документацией EnvyCRM, проверяем оба вероятных варианта
-    # ("whatsapp" и "wapi", по аналогии с Лолой). Сверить после первого
-    # реального сообщения через WhatsApp-канал и поправить при необходимости.
+    # Канал определяем по integration.service — значение для WhatsApp может быть "whatsapp" или "wapi".
     is_whatsapp_service = payload.get("integration", {}).get("service") in ("whatsapp", "wapi")
     if is_whatsapp_service and BOT_PAUSED_WHATSAPP:
         return web.Response(text="ok")
@@ -1759,7 +1776,7 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
         from_user = payload.get("from_user") or {}
         crm_employee_id = from_user.get("crm_employee_id")
         if crm_employee_id and crm_employee_id != 0 and crm_employee_id > 100000:
-            # Lesson (перенесено с Лолы): EnvyCRM иногда шлёт message_reply с пустым
+            # Lesson: EnvyCRM иногда шлёт message_reply с пустым
             # message_text, когда менеджер просто открыл карточку клиента, ничего не
             # печатая. Это не реальный ответ — не переводим чат в STATE_MANAGER за это.
             if not message_text.strip():
@@ -2047,7 +2064,12 @@ async def summarize_top_questions(texts: list[str]) -> str:
             ),
             messages=[{"role": "user", "content": joined[:20000]}],
         )
-        return msg.content[0].text.strip()
+        # Извлечь текст из всех TextBlock'ов, игнорировать ThinkingBlock
+        text_parts = []
+        for block in msg.content:
+            if hasattr(block, 'text'):
+                text_parts.append(block.text)
+        return "".join(text_parts).strip()
     except Exception as e:
         log.error(f"❌ summarize_top_questions error: {e}")
         return "— не удалось проанализировать —"
@@ -2109,8 +2131,7 @@ async def build_dialogues_docx(since: datetime, until: datetime, label_date: str
     календарные сутки по Астане, см. build_and_send_dialogues_export),
     сгруппированными по каналу (WhatsApp/Instagram определяем по префиксу
     'wapp-' в chat_id, как и везде в коде) и внутри канала — по chat_id, в
-    хронологии. Формат — по образцу выгрузки Лолы (см.
-    dialogues_2026-07-21.docx): просто дамп реплик, без анализа/статистики.
+    хронологии. Формат: дамп реплик с metadata (роль, время, менеджер).
     label_date — дата экспортируемых суток (для имени файла), не сегодняшняя.
     Возвращает (путь_к_файлу, имя_файла) или None, если сообщений не было."""
     async with db_pool.acquire() as conn:
@@ -2127,7 +2148,7 @@ async def build_dialogues_docx(since: datetime, until: datetime, label_date: str
         by_chat.setdefault(r["chat_id"], []).append(r)
 
     # Порядок чатов внутри канала — по времени первого сообщения за период,
-    # как читается в примере Лолы (не алфавитный).
+    # как читается в файле экспорта (не алфавитный).
     ordered_chat_ids = sorted(by_chat.keys(), key=lambda cid: by_chat[cid][0]["created_at"])
     whatsapp_ids = [cid for cid in ordered_chat_ids if cid.startswith("wapp-")]
     instagram_ids = [cid for cid in ordered_chat_ids if not cid.startswith("wapp-")]
