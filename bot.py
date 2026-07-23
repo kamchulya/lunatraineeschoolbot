@@ -1176,19 +1176,84 @@ def detect_demo_sent(reply: str) -> bool:
     return any(marker in reply.lower() for marker in demo_markers)
 
 
+async def _call_deepseek_once(messages: list[dict], system_blocks: list[dict]) -> str | None:
+    """Попытка позвать DeepSeek один раз. Возвращает текст или None если пусто/ошибка."""
+    try:
+        client = anthropic.AsyncAnthropic(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+        
+        # Таймаут 15 сек, thinking отключен
+        msg = await asyncio.wait_for(
+            client.messages.create(
+                model=DEEPSEEK_MODEL,
+                max_tokens=1024,
+                temperature=0.2,
+                system=system_blocks,
+                messages=messages,
+                extra_body={"thinking": {"type": "disabled"}},  # Отключить reasoning/thinking
+            ),
+            timeout=15.0
+        )
+        
+        # Извлечь текст из всех TextBlock'ов, игнорировать ThinkingBlock
+        text_parts = []
+        for block in msg.content:
+            if hasattr(block, 'text'):
+                text_parts.append(block.text)
+        
+        result = "".join(text_parts).strip()
+        return result if result else None
+        
+    except asyncio.TimeoutError:
+        log.warning(f"⏱️ DeepSeek timeout (15сек)")
+        return None
+    except Exception as e:
+        log.warning(f"⚠️ DeepSeek exception: {e}")
+        return None
+
+
+async def _call_openai_once(messages: list[dict], system_prompt: str) -> str | None:
+    """Попытка позвать OpenAI (gpt-5-mini на казахском) один раз. Возвращает текст или None если пусто/ошибка."""
+    try:
+        client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+        
+        # Таймаут 15 сек, max_completion_tokens (не max_tokens!)
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model="gpt-5-mini",
+                max_completion_tokens=1024,
+                temperature=0.2,
+                system_prompt=system_prompt,
+                messages=messages,
+            ),
+            timeout=15.0
+        )
+        
+        if response.choices and response.choices[0].message.content:
+            result = response.choices[0].message.content.strip()
+            return result if result else None
+        return None
+        
+    except asyncio.TimeoutError:
+        log.warning(f"⏱️ OpenAI timeout (15сек)")
+        return None
+    except Exception as e:
+        log.warning(f"⚠️ OpenAI exception: {e}")
+        return None
+
+
 async def claude_reply(messages: list[dict], system_prompt: str | None = None, kb: str | None = None) -> str:
+    """
+    Интеллектуальный fallback:
+    1. DeepSeek (попытка 1) → повтор (попытка 2) → OpenAI (попытка 3, только если DeepSeek 2x пустой)
+    2. OpenAI (повтор) → фолбэк-текст если всё не сработало
+    
+    Timeout/exception обрабатываются как пустой content (одинаковый путь).
+    """
     # Убираем ведущие assistant-сообщения
     while messages and messages[0].get("role") == "assistant":
         messages = messages[1:]
-    # Anthropic API требует строгого чередования ролей user/assistant. Подряд
-    # идущие сообщения одной роли РЕАЛЬНО случаются — например несколько
-    # сообщений клиента подряд, пока чат в STATE_MANAGER и ни бот, ни менеджер
-    # ещё не ответили (см. save_pending_message). ВАЖНО: раньше такие
-    # сообщения просто ВЫБРАСЫВАЛИСЬ (continue без добавления) — модель никогда
-    # не видела второе и последующие сообщения клиента в таком блоке, из-за
-    # чего Луна теряла контекст и отвечала мимо того, что клиент реально
-    # написал последним. Вместо потери — склеиваем содержимое подряд идущих
-    # сообщений одной роли в одно сообщение.
+    
+    # Merging consecutive same-role messages
     cleaned = []
     for msg in messages:
         role = msg.get("role")
@@ -1206,9 +1271,7 @@ async def claude_reply(messages: list[dict], system_prompt: str | None = None, k
     if not messages:
         messages = [{"role": "user", "content": "Здравствуйте"}]
 
-    # Два отдельных кешируемых блока:
-    # Блок 1 — промпт (меняется редко, кеш живёт долго)
-    # Блок 2 — база знаний из Sheets (меняется каждые 30 мин, свой кеш)
+    # Prepare system blocks (для DeepSeek и OpenAI)
     system_blocks = [
         {
             "type": "text",
@@ -1222,16 +1285,37 @@ async def claude_reply(messages: list[dict], system_prompt: str | None = None, k
             "text": "<knowledge_base>\n" + kb + "\n</knowledge_base>",
             "cache_control": {"type": "ephemeral"},
         })
+    
+    # Для OpenAI нужна система как строка, не список блоков
+    system_text = system_prompt or SYSTEM_PROMPT
+    if kb:
+        system_text += "\n\n<knowledge_base>\n" + kb + "\n</knowledge_base>"
 
-    client = anthropic.AsyncAnthropic(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
-    msg = await client.messages.create(
-        model=DEEPSEEK_MODEL,
-        max_tokens=1024,
-        temperature=0.2,
-        system=system_blocks,
-        messages=messages,
-    )
-    return msg.content[0].text
+    # === ПОПЫТКА 1-2: DeepSeek ===
+    for attempt in range(1, 3):
+        log.debug(f"🔵 DeepSeek попытка {attempt}/2...")
+        result = await _call_deepseek_once(messages, system_blocks)
+        if result:
+            log.info(f"✅ DeepSeek успешен (попытка {attempt})")
+            return result
+        log.warning(f"❌ DeepSeek попытка {attempt} вернула пусто/ошибка, повторяем...")
+    
+    # === ПОПЫТКА 3-4: OpenAI (только если DeepSeek дважды пустой) ===
+    log.warning(f"⚠️ DeepSeek дважды пустой, переключаемся на OpenAI (gpt-5-mini)...")
+    for attempt in range(1, 3):
+        log.debug(f"🟠 OpenAI попытка {attempt}/2...")
+        result = await _call_openai_once(messages, system_text)
+        if result:
+            log.info(f"✅ OpenAI успешен (попытка {attempt})")
+            return result
+        log.warning(f"❌ OpenAI попытка {attempt} вернула пусто/ошибка, повторяем...")
+    
+    # === ФИНАЛ: Фолбэк если всё не сработало ===
+    log.error(f"❌ Оба провайдера (DeepSeek, OpenAI) не смогли ответить, используем fallback")
+    # Определить язык по истории сообщений
+    last_text = messages[-1].get("content", "") if messages else ""
+    lang = "kz" if any(c in last_text for c in "әіңғүұқө") else "ru"
+    return CLAUDE_FALLBACK.get(lang, CLAUDE_FALLBACK["ru"])
 
 
 async def transcribe_audio(url: str) -> str | None:

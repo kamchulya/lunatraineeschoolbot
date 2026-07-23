@@ -1,0 +1,88 @@
+🚀 ДЕПЛОЙ ЛУНЫ — БЫСТРАЯ ИНСТРУКЦИЯ
+
+═══════════════════════════════════════════════════════════
+
+ФАЙЛЫ ДЛЯ ЗАМЕНЫ:
+
+1. bot.py → замени полностью (из outputs)
+   - Новая claude_reply с DeepSeek → OpenAI fallback
+   - Отключен thinking (убирает ThinkingBlock ошибки)
+   - Timeout 15сек, retry логика
+
+2. config.py → замени полностью (из outputs)
+   - Добавлены: DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
+
+3. prompt.py → замени полностью (из outputs)
+   - Предоплата исправлена: 19900 → 30000 тг (три места)
+
+═══════════════════════════════════════════════════════════
+
+RAILWAY ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (добавить в проект):
+
+Если их ещё нет — добавить:
+
+DEEPSEEK_API_KEY = [ключ от DeepSeek]
+DEEPSEEK_BASE_URL = https://api.deepseek.com
+DEEPSEEK_MODEL = deepseek-v4-flash
+
+Остальные (OPENAI_API_KEY, ANTHROPIC_API_KEY и т.д.) уже должны быть.
+
+═══════════════════════════════════════════════════════════
+
+ПРОЦЕСС ДЕПЛОЯ:
+
+1. Скопировать файлы в репозиторий:
+   $ git pull
+   $ cp bot.py config.py prompt.py [ваш-репо]/
+   $ git add bot.py config.py prompt.py
+   $ git commit -m "fix: claude_reply fallback deepseek→openai, disable thinking"
+   $ git push
+
+2. Railway автоматически перестартует сервис
+   - Check Railway logs для "Starting Container..."
+
+3. Ждёте пока бот перезагрузится (1-2 минуты)
+
+4. Тестовое сообщение от клиента (или сам напиши в InstaGram DM)
+   - Посмотрите логи: ищите "✅ DeepSeek успешен"
+   - Если пусто → переключение на OpenAI
+
+5. Всё готово! ✅
+
+═══════════════════════════════════════════════════════════
+
+ЛОГИ ДЛЯ ПРОВЕРКИ:
+
+Успех:
+  ✅ DeepSeek успешен (попытка 1)
+
+Переключение на OpenAI (нормально):
+  ❌ DeepSeek попытка 2 вернула пусто/ошибка, повторяем...
+  ⚠️ DeepSeek дважды пустой, переключаемся на OpenAI (gpt-5-mini)...
+  ✅ OpenAI успешен (попытка 1)
+
+Редко (финальный фолбэк):
+  ❌ Оба провайдера (DeepSeek, OpenAI) не смогли ответить, используем fallback
+
+═══════════════════════════════════════════════════════════
+
+ПРОВЕРИТЬ ПРИ ПРОБЛЕМАХ:
+
+1. DeepSeek ключ в Railway env?
+   $ railway logs | grep "DeepSeek"
+
+2. OpenAI ключ в Railway env?
+   $ railway logs | grep "OpenAI"
+
+3. Какая ошибка в логах?
+   $ railway logs | grep -i error
+
+4. Где застрял?
+   $ railway logs | grep "claude_reply\|Deep\|OpenAI"
+
+═══════════════════════════════════════════════════════════
+
+ГОТОВО К ДЕПЛОЮ! 🎉
+
+Все файлы в /mnt/user-data/outputs/
+Подробно в ИЗМЕНЕНИЯ.md
