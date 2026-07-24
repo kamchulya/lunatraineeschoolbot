@@ -2025,6 +2025,14 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
         message_text = (payload.get("message_data") or {}).get("text") or ""
         contact_check = payload.get("contact") or {}
         chat_id_check = str(contact_check.get("external_id") or "").strip()
+        
+        # 🔴 ФИЛЬТР: игнорируем СИСТЕМНЫЕ сообщения от Wazzup (SYSTEM WZ, etc)
+        from_user = payload.get("from_user") or {}
+        from_user_name = from_user.get("name") or ""
+        if "SYSTEM" in from_user_name.upper() or "WZ" in from_user_name:
+            log.info(f"🤖 Системное сообщение от Wazzup '{from_user_name}' — игнорируем")
+            return web.Response(text="ok")
+        
         if chat_id_check.startswith("inst-"):
             chat_id_check = chat_id_check[5:]
         elif is_whatsapp_service and not chat_id_check.startswith("wapp-"):
@@ -2045,7 +2053,6 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
                 await set_state(chat_id_check, STATE_SMM)
             return web.Response(text="ok")
 
-        from_user = payload.get("from_user") or {}
         crm_employee_id = from_user.get("crm_employee_id")
         if crm_employee_id and crm_employee_id != 0 and crm_employee_id > 100000:
             # Lesson: EnvyCRM иногда шлёт message_reply с пустым
@@ -2104,6 +2111,13 @@ async def envy_hook_handler(request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
     from_user = payload.get("from_user") or {}
+    
+    # 🔴 ФИЛЬТР: игнорируем СИСТЕМНЫЕ сообщения от Wazzup (SYSTEM WZ, etc)
+    from_user_name = from_user.get("name") or ""
+    if "SYSTEM" in from_user_name.upper() or "WZ" in from_user_name:
+        log.info(f"🤖 Системное сообщение от Wazzup '{from_user_name}' — игнорируем")
+        return web.Response(text="ok")
+    
     crm_employee_id = from_user.get("crm_employee_id")
     if crm_employee_id is not None and crm_employee_id != 0 and crm_employee_id > 100000:
         await set_state(chat_id, STATE_MANAGER)
