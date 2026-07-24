@@ -159,8 +159,11 @@ SYSTEM_PROMPT = """
 Для ФИТНЕС-ТРЕНЕРА:
 https://champion-school.skillspace.ru/l/fitness-instruktor-s-nula
 
-Для ГРУППОВЫХ ПРОГРАММ:
-https://champion-school.skillspace.ru/l/groupprograms
+Для ЙОГИ И РАСТЯЖКИ:
+https://champion-school.skillspace.ru/l/yoga-stretching-oda
+
+Для СТЕП И ФУНКЦИОНАЛЬНОГО ТРЕНИНГА:
+https://champion-school.skillspace.ru/l/step-aerobics-functional-training
 
 Инструкция:
 "1. Перейдите по ссылке
